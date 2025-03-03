@@ -1,4 +1,4 @@
-//! multi proof task related functionality.
+//! Multiproof task related functionality.
 
 use crate::tree::payload_processor::{executor::WorkloadExecutor, sparse_trie::SparseTrieEvent};
 use alloy_primitives::map::HashSet;
@@ -31,7 +31,7 @@ use tracing::{debug, error, trace};
 /// A trie update that can be applied to sparse trie alongside the proofs for touched parts of the
 /// state.
 #[derive(Default, Debug)]
-pub(super) struct SparseTrieUpdate {
+pub struct SparseTrieUpdate {
     /// The state update that was used to calculate the proof
     pub(crate) state: HashedPostState,
     /// The calculated multiproof
@@ -108,7 +108,7 @@ pub(super) enum MultiProofMessage {
     ProofCalculationError(ProviderError),
     /// Signals state update stream end.
     ///
-    /// This is triggerred by block execution, indicating that no additional state updates are
+    /// This is triggered by block execution, indicating that no additional state updates are
     /// expected.
     FinishedStateUpdates,
 }
@@ -187,7 +187,7 @@ impl ProofSequencer {
 /// A wrapper for the sender that signals completion when dropped.
 ///
 /// This type is intended to be used in combination with the evm executor statehook.
-/// This should trigger once the block has been executed (after) the last state upddate has been
+/// This should trigger once the block has been executed (after) the last state update has been
 /// sent. This triggers the exit condition of the multi proof task.
 #[derive(Deref, Debug)]
 pub(super) struct StateHookSender(Sender<MultiProofMessage>);
@@ -205,7 +205,7 @@ impl Drop for StateHookSender {
     }
 }
 
-fn evm_state_to_hashed_post_state(update: EvmState) -> HashedPostState {
+pub(crate) fn evm_state_to_hashed_post_state(update: EvmState) -> HashedPostState {
     let mut hashed_state = HashedPostState::with_capacity(update.len());
 
     for (address, account) in update {
@@ -253,7 +253,7 @@ struct MultiproofInput<Factory> {
 /// concurrency, further calculation requests are queued and spawn later, after
 /// availability has been signaled.
 #[derive(Debug)]
-struct MultiproofManager<Factory> {
+pub struct MultiproofManager<Factory> {
     /// Maximum number of concurrent calculations.
     max_concurrent: usize,
     /// Currently running calculations.
@@ -401,6 +401,8 @@ pub(crate) struct MultiProofTaskMetrics {
     pub sparse_trie_update_duration_histogram: Histogram,
     /// Histogram of sparse trie final update durations.
     pub sparse_trie_final_update_duration_histogram: Histogram,
+    /// Histogram of sparse trie total durations.
+    pub sparse_trie_total_duration_histogram: Histogram,
 
     /// Histogram of state updates received.
     pub state_updates_received_histogram: Histogram,

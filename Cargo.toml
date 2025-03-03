@@ -1,7 +1,7 @@
 [workspace.package]
 version = "1.2.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 homepage = "https://paradigmxyz.github.io/reth"
 repository = "https://github.com/paradigmxyz/reth"
@@ -218,6 +218,7 @@ option_as_ref_cloned = "warn"
 or_fun_call = "warn"
 path_buf_push_overwrite = "warn"
 read_zero_byte_vec = "warn"
+result_large_err = "allow"
 redundant_clone = "warn"
 redundant_else = "warn"
 single_char_pattern = "warn"
@@ -483,12 +484,12 @@ alloy-transport-ws = { version = "0.11.1", default-features = false }
 
 # op
 alloy-op-evm = { version = "0.1", default-features = false }
-op-alloy-rpc-types = { version = "0.10.5", default-features = false }
-op-alloy-rpc-types-engine = { version = "0.10.5", default-features = false }
-op-alloy-network = { version = "0.10.5", default-features = false }
-op-alloy-consensus = { version = "0.10.5", default-features = false }
-op-alloy-flz = { version = "0.10.5", default-features = false }
-op-alloy-rpc-jsonrpsee = { version = "0.10.5", default-features = false }
+op-alloy-rpc-types = { version = "0.10.7", default-features = false }
+op-alloy-rpc-types-engine = { version = "0.10.7", default-features = false }
+op-alloy-network = { version = "0.10.7", default-features = false }
+op-alloy-consensus = { version = "0.10.7", default-features = false }
+op-alloy-flz = { version = "0.10.7", default-features = false }
+op-alloy-rpc-jsonrpsee = { version = "0.10.7", default-features = false }
 
 # misc
 aquamarine = "0.6"
