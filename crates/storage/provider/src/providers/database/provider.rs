@@ -550,7 +550,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         )
     }
 
-    fn block_with_senders<H, HF, B, BF>(
+    fn recovered_block<H, HF, B, BF>(
         &self,
         id: BlockHashOrNumber,
         _transaction_kind: TransactionVariant,
@@ -1011,10 +1011,12 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderProvider for DatabasePro
     }
 
     fn header_td_by_number(&self, number: BlockNumber) -> ProviderResult<Option<U256>> {
-        if let Some(td) = self.chain_spec.final_paris_total_difficulty(number) {
-            // if this block is higher than the final paris(merge) block, return the final paris
-            // difficulty
-            return Ok(Some(td))
+        if self.chain_spec.is_paris_active_at_block(number) {
+            if let Some(td) = self.chain_spec.final_paris_total_difficulty() {
+                // if this block is higher than the final paris(merge) block, return the final paris
+                // difficulty
+                return Ok(Some(td))
+            }
         }
 
         self.static_file_provider.get_with_static_file_or_database(
@@ -1215,12 +1217,12 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
     /// If the header for this block is not found, this returns `None`.
     /// If the header is found, but the transactions either do not exist, or are not indexed, this
     /// will return None.
-    fn block_with_senders(
+    fn recovered_block(
         &self,
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        self.block_with_senders(
+        self.recovered_block(
             id,
             transaction_kind,
             |block_number| self.header_by_number(block_number),
@@ -1241,7 +1243,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        self.block_with_senders(
+        self.recovered_block(
             id,
             transaction_kind,
             |block_number| self.sealed_header(block_number),
@@ -1280,7 +1282,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
         )
     }
 
-    fn sealed_block_with_senders_range(
+    fn recovered_block_range(
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
@@ -1604,7 +1606,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> OmmersProvider for DatabasePro
         if let Some(number) = self.convert_hash_or_number(id)? {
             // If the Paris (Merge) hardfork block is known and block is after it, return empty
             // ommers.
-            if self.chain_spec.final_paris_total_difficulty(number).is_some() {
+            if self.chain_spec.is_paris_active_at_block(number) {
                 return Ok(Some(Vec::new()))
             }
 
@@ -2757,7 +2759,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockExecu
         // get execution res
         let execution_state = self.take_state_above(block, remove_from)?;
 
-        let blocks = self.sealed_block_with_senders_range(range)?;
+        let blocks = self.recovered_block_range(range)?;
 
         // remove block bodies it is needed for both get block range and get block execution results
         // that is why it is deleted afterwards.

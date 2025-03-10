@@ -638,7 +638,7 @@ where
     <P as DatabaseProviderFactory>::Provider:
         BlockReader<Block = N::Block, Header = N::BlockHeader>,
     E: BlockExecutorProvider<Primitives = N>,
-    C: ConfigureEvm<Header = N::BlockHeader, Transaction = N::SignedTx> + 'static,
+    C: ConfigureEvm<Primitives = N> + 'static,
     T: EngineTypes,
     V: EngineValidator<T, Block = N::Block>,
 {
@@ -2430,10 +2430,18 @@ where
             if self.config.use_state_root_task() {
                 match handle.state_root() {
                     Ok(StateRootComputeOutcome { state_root, trie_updates }) => {
+                        let elapsed = execution_finish.elapsed();
+                        info!(target: "engine::tree", ?state_root, ?elapsed, "State root task finished");
                         // we double check the state root here for good measure
                         if state_root == block.header().state_root() {
-                            maybe_state_root =
-                                Some((state_root, trie_updates, execution_finish.elapsed()))
+                            maybe_state_root = Some((state_root, trie_updates, elapsed))
+                        } else {
+                            warn!(
+                                target: "engine::tree",
+                                ?state_root,
+                                block_state_root = ?block.header().state_root(),
+                                "State root task returned incorrect state root"
+                            );
                         }
                     }
                     Err(error) => {
