@@ -25,6 +25,7 @@ use reth_execution_types::ExecutionOutcome;
 use reth_optimism_evm::OpNextBlockEnvAttributes;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::transaction::signed::OpTransaction;
+use reth_optimism_txpool::OpPooledTx;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_payload_util::{BestPayloadTransactions, NoopPayloadTransactions, PayloadTransactions};
@@ -121,7 +122,7 @@ impl<Pool, Client, Evm, Txs> OpPayloadBuilder<Pool, Client, Evm, Txs> {
 
 impl<Pool, Client, Evm, N, T> OpPayloadBuilder<Pool, Client, Evm, T>
 where
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = N::SignedTx>>,
+    Pool: TransactionPool<Transaction: OpPooledTx<Consensus = N::SignedTx>>,
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthChainSpec + OpHardforks>,
     N: OpPayloadPrimitives,
     Evm: ConfigureEvm<Primitives = N, NextBlockEnvCtx = OpNextBlockEnvAttributes>,
@@ -198,7 +199,7 @@ impl<Pool, Client, Evm, N, Txs> PayloadBuilder for OpPayloadBuilder<Pool, Client
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthChainSpec + OpHardforks> + Clone,
     N: OpPayloadPrimitives,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = N::SignedTx>>,
+    Pool: TransactionPool<Transaction: OpPooledTx<Consensus = N::SignedTx>>,
     Evm: ConfigureEvm<Primitives = N, NextBlockEnvCtx = OpNextBlockEnvAttributes>,
     Txs: OpPayloadTransactions<Pool::Transaction>,
 {
@@ -312,9 +313,8 @@ impl<Txs> OpBuilder<'_, Txs> {
             }
         }
 
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } = builder
-            .finish(state_provider)
-            .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
+            builder.finish(state_provider)?;
 
         let sealed_block = Arc::new(block.sealed_block().clone());
         debug!(target: "payload_builder", id=%ctx.attributes().payload_id(), sealed_block_header = ?sealed_block.header(), "sealed built block");
@@ -369,9 +369,9 @@ impl<Txs> OpBuilder<'_, Txs> {
             .build();
         let mut builder = ctx.block_builder(&mut db)?;
 
-        builder.apply_pre_execution_changes().map_err(PayloadBuilderError::evm)?;
+        builder.apply_pre_execution_changes()?;
         ctx.execute_sequencer_transactions(&mut builder)?;
-        builder.into_executor().apply_post_execution_changes().map_err(PayloadBuilderError::evm)?;
+        builder.into_executor().apply_post_execution_changes()?;
 
         let ExecutionWitnessRecord { hashed_state, codes, keys } =
             ExecutionWitnessRecord::from_executed_state(&db);
