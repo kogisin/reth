@@ -1,7 +1,7 @@
 //! This example shows how implement a custom node.
 //!
 //! A node consists of:
-//! - primtives: block,header,transactions
+//! - primitives: block,header,transactions
 //! - components: network,pool,evm
 //! - engine: advances the node
 
@@ -32,14 +32,14 @@ impl NodeTypes for CustomNode {
 }
 
 impl NodeTypesWithEngine for CustomNode {
-    type Engine = CustomEngineTypes;
+    type Payload = CustomEngineTypes;
 }
 
 impl<N> Node<N> for CustomNode
 where
     N: FullNodeTypes<
         Types: NodeTypesWithEngine<
-            Engine = CustomEngineTypes,
+            Payload = CustomEngineTypes,
             ChainSpec = CustomChainSpec,
             Primitives = CustomNodePrimitives,
             Storage = OpStorage,
