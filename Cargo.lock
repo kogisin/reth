@@ -3468,7 +3468,10 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
+ "async-trait",
  "derive_more 2.0.1",
+ "eyre",
+ "jsonrpsee",
  "op-alloy-consensus",
  "op-alloy-rpc-types-engine",
  "reth-chain-state",
@@ -3482,6 +3485,7 @@ dependencies = [
  "reth-optimism-node",
  "reth-optimism-primitives",
  "reth-primitives-traits",
+ "reth-rpc-api",
  "revm-primitives",
  "serde",
 ]
@@ -8005,6 +8009,7 @@ dependencies = [
  "reth-chainspec",
  "reth-cli",
  "reth-cli-commands",
+ "reth-ethereum-cli",
 ]
 
 [[package]]
@@ -9119,10 +9124,14 @@ version = "1.3.4"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
+ "alloy-json-rpc",
  "alloy-primitives",
+ "alloy-rpc-client",
  "alloy-rpc-types-debug",
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
+ "alloy-transport",
+ "alloy-transport-http",
  "async-trait",
  "derive_more 2.0.1",
  "jsonrpsee",
@@ -9159,7 +9168,6 @@ dependencies = [
  "reth-tasks",
  "reth-transaction-pool",
  "revm",
- "serde_json",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
