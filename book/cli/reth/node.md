@@ -362,6 +362,11 @@ RPC:
 
           [default: 50000000]
 
+      --rpc.txfeecap <TX_FEE_CAP>
+          Maximum eth transaction fee that can be sent via the RPC APIs (0 = no cap)
+
+          [default: 1.0]
+
       --rpc.max-simulate-blocks <BLOCKS_COUNT>
           Maximum number of blocks for `eth_simulateV1` call
 
@@ -752,6 +757,9 @@ Engine:
           Configure the number of reserved CPU cores for non-reth processes
 
           [default: 1]
+
+      --engine.precompile-cache
+          Enable precompile cache
 
 Ress:
       --ress.enable
