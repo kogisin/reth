@@ -1,4 +1,12 @@
 use crate::blinded::{BlindedProvider, DefaultBlindedProvider, RevealedNode};
+use alloc::{
+    borrow::Cow,
+    boxed::Box,
+    fmt,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use alloy_primitives::{
     hex, keccak256,
     map::{Entry, HashMap, HashSet},
@@ -6,14 +14,13 @@ use alloy_primitives::{
 };
 use alloy_rlp::Decodable;
 use reth_execution_errors::{SparseTrieErrorKind, SparseTrieResult};
-use reth_tracing::tracing::trace;
 use reth_trie_common::{
     prefix_set::{PrefixSet, PrefixSetMut},
     BranchNodeCompact, BranchNodeRef, ExtensionNodeRef, LeafNodeRef, Nibbles, RlpNode, TrieMask,
     TrieNode, CHILD_INDEX_RANGE, EMPTY_ROOT_HASH,
 };
 use smallvec::SmallVec;
-use std::{borrow::Cow, fmt};
+use tracing::trace;
 
 /// Struct for passing around `hash_mask` and `tree_mask`
 #[derive(Debug)]
@@ -585,10 +592,7 @@ impl<P> RevealedSparseTrie<P> {
                         current.extend_from_slice_unchecked(key);
                         assert!(
                             path.starts_with(&current),
-                            "path: {:?}, current: {:?}, key: {:?}",
-                            path,
-                            current,
-                            key
+                            "path: {path:?}, current: {current:?}, key: {key:?}",
                         );
                     }
 
@@ -600,11 +604,7 @@ impl<P> RevealedSparseTrie<P> {
                     let nibble = path[current.len()];
                     debug_assert!(
                         state_mask.is_bit_set(nibble),
-                        "current: {:?}, path: {:?}, nibble: {:?}, state_mask: {:?}",
-                        current,
-                        path,
-                        nibble,
-                        state_mask
+                        "current: {current:?}, path: {path:?}, nibble: {nibble:?}, state_mask: {state_mask:?}",
                     );
 
                     // If the branch node has a child that is a leaf node that we're removing,
@@ -653,7 +653,7 @@ impl<P> RevealedSparseTrie<P> {
     /// Updates all remaining dirty nodes before calculating the root.
     pub fn root(&mut self) -> B256 {
         // Take the current prefix set
-        let mut prefix_set = std::mem::take(&mut self.prefix_set).freeze();
+        let mut prefix_set = core::mem::take(&mut self.prefix_set).freeze();
         let rlp_node = self.rlp_node_allocate(&mut prefix_set);
         if let Some(root_hash) = rlp_node.as_hash() {
             root_hash
@@ -666,7 +666,7 @@ impl<P> RevealedSparseTrie<P> {
     /// depth. Root node has a level of 0.
     pub fn update_rlp_node_level(&mut self, depth: usize) {
         // Take the current prefix set
-        let mut prefix_set = std::mem::take(&mut self.prefix_set).freeze();
+        let mut prefix_set = core::mem::take(&mut self.prefix_set).freeze();
         let mut buffers = RlpNodeBuffers::default();
 
         // Get the nodes that have changed at the given depth.
@@ -769,7 +769,7 @@ impl<P> RevealedSparseTrie<P> {
         prefix_set: &mut PrefixSet,
         buffers: &mut RlpNodeBuffers,
     ) -> RlpNode {
-        let starting_path = buffers.path_stack.last().map(|item| item.path.clone());
+        let _starting_path = buffers.path_stack.last().map(|item| item.path.clone());
 
         'main: while let Some(RlpNodePathStackItem { level, path, mut is_in_prefix_set }) =
             buffers.path_stack.pop()
@@ -777,7 +777,7 @@ impl<P> RevealedSparseTrie<P> {
             let node = self.nodes.get_mut(&path).unwrap();
             trace!(
                 target: "trie::sparse",
-                ?starting_path,
+                ?_starting_path,
                 ?level,
                 ?path,
                 ?is_in_prefix_set,
@@ -1040,7 +1040,7 @@ impl<P> RevealedSparseTrie<P> {
 
             trace!(
                 target: "trie::sparse",
-                ?starting_path,
+                ?_starting_path,
                 ?level,
                 ?path,
                 ?node,
@@ -1447,7 +1447,7 @@ impl<P: BlindedProvider> RevealedSparseTrie<P> {
                         SparseNode::Branch { .. } => removed_node.node,
                     }
                 }
-                SparseNode::Branch { mut state_mask, hash: _, store_in_db_trie: _ } => {
+                &SparseNode::Branch { mut state_mask, hash: _, store_in_db_trie: _ } => {
                     // If the node is a branch node, we need to check the number of children left
                     // after deleting the child at the given nibble.
 
@@ -2237,8 +2237,7 @@ mod tests {
             };
             assert!(
                 equals,
-                "path: {:?}\nproof node: {:?}\nsparse node: {:?}",
-                proof_node_path, proof_node, sparse_node
+                "path: {proof_node_path:?}\nproof node: {proof_node:?}\nsparse node: {sparse_node:?}"
             );
         }
     }
