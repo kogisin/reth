@@ -53,7 +53,7 @@ jobs:
             !**/*.svg
           isolated: true
 
-  spellcheck_yandex:
+    spellcheck_yandex:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -77,7 +77,7 @@ jobs:
             content=$(cat "$file" | tr '\n' ' ' | tr -s ' ' | head -c 10000)
             if [ -z "$content" ]; then continue; fi
 
-            python3 - "$file" << 'EOF'
+            echo "$content" | python3 - "$file" << 'EOF'
 import sys, requests
 text = sys.stdin.read()
 file = sys.argv[1]
