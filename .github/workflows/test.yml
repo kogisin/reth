@@ -1,4 +1,4 @@
-name: Check links and Spell Check
+name: check_v1
 
 on:
   push:
@@ -21,7 +21,23 @@ jobs:
         with:
           args: --no-progress --accept 200,429 --exclude "http://localhost(:[0-9]+)?/" --exclude "enode://*" --exclude "http://127.0.0.1(:[0-9]+)?/" --verbose "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
 
-  spellcheck_v2:
+  spellcheck:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Codespell
+        run: pip install codespell
+
+      - name: Run Codespell
+        run: |
+          codespell \
+          --ignore-words=.codespellrc \
+          --skip="*.min.js,*.json,*.lock,*.bin,*.svg"
+
+  spellcheck_2:
     runs-on: ubuntu-latest
 
     steps:
@@ -39,19 +55,46 @@ jobs:
             !**/*.bin
             !**/*.svg
           isolated: true
-          
-  spellcheck_v1:
+
+  spellcheck_yandex:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Codespell
-        run: pip install codespell
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
 
-      - name: Run Codespell
+      - name: Install requests module
+        run: pip install requests
+
+      - name: Run Yandex.Speller
         run: |
-          codespell \
-          --ignore-words=.codespellrc \
-          --skip="*.min.js,*.json,*.lock,*.bin,*.svg"
+          set -e
+          find . -type f \( -name "*.md" -o -name "*.rs" -o -name "*.ts" -o -name "*.tsx" -o -name "*.mdx" \) > files.txt
+
+          while IFS= read -r file; do
+            echo "Checking $file"
+            content=$(cat "$file" | tr '\n' ' ' | tr -s ' ' | head -c 10000)
+            if [ -z "$content" ]; then continue; fi
+
+            echo "$content" | python3 - "$file" <<EOF
+import sys, requests
+text = sys.stdin.read()
+file = sys.argv[1]
+url = 'https://speller.yandex.net/services/spellservice.json/checkText'
+params = {'text': text, 'lang': 'en,ru'}
+resp = requests.get(url, params=params)
+errors = resp.json()
+if errors:
+    print(f'Found spelling issues in: {file}')
+    for err in errors:
+        word = err.get('word')
+        suggestions = ', '.join(err.get('s', []))
+        print(f"- Word: {word}, Suggestions: {suggestions}")
+    sys.exit(1)
+EOF
+          done
