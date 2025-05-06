@@ -1,3 +1,4 @@
+
 name: check_v1
 
 on:
@@ -11,6 +12,7 @@ on:
 jobs:
   check-links:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,6 +24,7 @@ jobs:
 
   spellcheck:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -34,9 +37,10 @@ jobs:
           codespell \
           --ignore-words=.codespellrc \
           --skip="*.min.js,*.json,*.lock,*.bin,*.svg"
-
+          
   spellcheck_2:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -52,45 +56,3 @@ jobs:
             !**/*.bin
             !**/*.svg
           isolated: true
-
-    spellcheck_yandex:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-
-      - name: Install requests module
-        run: pip install requests
-
-      - name: Run Yandex.Speller
-        run: |
-          set -e
-          find . -type f \( -name "*.md" -o -name "*.rs" -o -name "*.ts" -o -name "*.tsx" -o -name "*.mdx" \) > files.txt
-
-          while IFS= read -r file; do
-            echo "Checking $file"
-            content=$(cat "$file" | tr '\n' ' ' | tr -s ' ' | head -c 10000)
-            if [ -z "$content" ]; then continue; fi
-
-            echo "$content" | python3 - "$file" << 'EOF'
-import sys, requests
-text = sys.stdin.read()
-file = sys.argv[1]
-url = 'https://speller.yandex.net/services/spellservice.json/checkText'
-params = {'text': text, 'lang': 'en,ru'}
-resp = requests.get(url, params=params)
-errors = resp.json()
-if errors:
-    print(f'Found spelling issues in: {file}')
-    for err in errors:
-        word = err.get('word')
-        suggestions = ', '.join(err.get('s', []))
-        print(f"- Word: {word}, Suggestions: {suggestions}")
-    sys.exit(1)
-EOF
-          done < files.txt
