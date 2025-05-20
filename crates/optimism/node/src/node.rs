@@ -41,8 +41,6 @@ use reth_optimism_rpc::{
     OpEthApi, OpEthApiError, SequencerClient,
 };
 use reth_optimism_txpool::{
-    conditional::MaybeConditionalTransaction,
-    interop::MaybeInteropTransaction,
     supervisor::{SupervisorClient, DEFAULT_SUPERVISOR_URL},
     OpPooledTx,
 };
@@ -192,8 +190,10 @@ where
         OpConsensusBuilder,
     >;
 
-    type AddOns =
-        OpAddOns<NodeAdapter<N, <Self::ComponentsBuilder as NodeComponentsBuilder<N>>::Components>>;
+    type AddOns = OpAddOns<
+        NodeAdapter<N, <Self::ComponentsBuilder as NodeComponentsBuilder<N>>::Components>,
+        OpEthApiBuilder,
+    >;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
         Self::components(self)
@@ -236,19 +236,15 @@ impl NodeTypes for OpNode {
 
 /// Add-ons w.r.t. optimism.
 #[derive(Debug)]
-pub struct OpAddOns<N>
-where
+pub struct OpAddOns<
     N: FullNodeComponents,
-    OpEthApiBuilder: EthApiBuilder<N>,
-{
+    EthB: EthApiBuilder<N>,
+    EV = OpEngineValidatorBuilder,
+    EB = OpEngineApiBuilder<OpEngineValidatorBuilder>,
+> {
     /// Rpc add-ons responsible for launching the RPC servers and instantiating the RPC handlers
     /// and eth-api.
-    pub rpc_add_ons: RpcAddOns<
-        N,
-        OpEthApiBuilder,
-        OpEngineValidatorBuilder,
-        OpEngineApiBuilder<OpEngineValidatorBuilder>,
-    >,
+    pub rpc_add_ons: RpcAddOns<N, EthB, EV, EB>,
     /// Data availability configuration for the OP builder.
     pub da_config: OpDAConfig,
     /// Sequencer client, configured to forward submitted transactions to sequencer of given OP
@@ -258,7 +254,7 @@ where
     enable_tx_conditional: bool,
 }
 
-impl<N> Default for OpAddOns<N>
+impl<N> Default for OpAddOns<N, OpEthApiBuilder>
 where
     N: FullNodeComponents<Types: NodeTypes<Primitives = OpPrimitives>>,
     OpEthApiBuilder: EthApiBuilder<N>,
@@ -268,7 +264,7 @@ where
     }
 }
 
-impl<N> OpAddOns<N>
+impl<N> OpAddOns<N, OpEthApiBuilder>
 where
     N: FullNodeComponents<Types: NodeTypes<Primitives = OpPrimitives>>,
     OpEthApiBuilder: EthApiBuilder<N>,
@@ -279,7 +275,7 @@ where
     }
 }
 
-impl<N> NodeAddOns<N> for OpAddOns<N>
+impl<N> NodeAddOns<N> for OpAddOns<N, OpEthApiBuilder>
 where
     N: FullNodeComponents<
         Types: NodeTypes<
@@ -364,7 +360,7 @@ where
     }
 }
 
-impl<N> RethRpcAddOns<N> for OpAddOns<N>
+impl<N> RethRpcAddOns<N> for OpAddOns<N, OpEthApiBuilder>
 where
     N: FullNodeComponents<
         Types: NodeTypes<
@@ -386,7 +382,7 @@ where
     }
 }
 
-impl<N> EngineValidatorAddOn<N> for OpAddOns<N>
+impl<N> EngineValidatorAddOn<N> for OpAddOns<N, OpEthApiBuilder>
 where
     N: FullNodeComponents<
         Types: NodeTypes<
@@ -439,7 +435,7 @@ impl OpAddOnsBuilder {
 
 impl OpAddOnsBuilder {
     /// Builds an instance of [`OpAddOns`].
-    pub fn build<N>(self) -> OpAddOns<N>
+    pub fn build<N>(self) -> OpAddOns<N, OpEthApiBuilder>
     where
         N: FullNodeComponents<Types: NodeTypes<Primitives = OpPrimitives>>,
         OpEthApiBuilder: EthApiBuilder<N>,
@@ -449,8 +445,8 @@ impl OpAddOnsBuilder {
         OpAddOns {
             rpc_add_ons: RpcAddOns::new(
                 OpEthApiBuilder::default().with_sequencer(sequencer_url.clone()),
-                Default::default(),
-                Default::default(),
+                OpEngineValidatorBuilder::default(),
+                OpEngineApiBuilder::default(),
             ),
             da_config: da_config.unwrap_or_default(),
             sequencer_url,
@@ -538,9 +534,7 @@ impl<T> OpPoolBuilder<T> {
 impl<Node, T> PoolBuilder<Node> for OpPoolBuilder<T>
 where
     Node: FullNodeTypes<Types: NodeTypes<ChainSpec: OpHardforks>>,
-    T: EthPoolTransaction<Consensus = TxTy<Node::Types>>
-        + MaybeConditionalTransaction
-        + MaybeInteropTransaction,
+    T: EthPoolTransaction<Consensus = TxTy<Node::Types>> + OpPooledTx,
 {
     type Pool = OpTransactionPool<Node::Provider, DiskFileBlobStore, T>;
 
