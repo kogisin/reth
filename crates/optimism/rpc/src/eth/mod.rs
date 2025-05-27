@@ -18,7 +18,6 @@ use reth_evm::ConfigureEvm;
 use reth_network_api::NetworkInfo;
 use reth_node_api::{FullNodeComponents, NodePrimitives};
 use reth_node_builder::rpc::{EthApiBuilder, EthApiCtx};
-use reth_optimism_primitives::OpPrimitives;
 use reth_rpc::eth::{core::EthApiInner, DevSigner};
 use reth_rpc_eth_api::{
     helpers::{
@@ -81,11 +80,7 @@ impl<N: OpNodeCore, NetworkT> OpEthApi<N, NetworkT> {
 impl<N, NetworkT> OpEthApi<N, NetworkT>
 where
     N: OpNodeCore<
-        Provider: BlockReaderIdExt
-                      + ChainSpecProvider
-                      + CanonStateSubscriptions<Primitives = OpPrimitives>
-                      + Clone
-                      + 'static,
+        Provider: BlockReaderIdExt + ChainSpecProvider + CanonStateSubscriptions + Clone + 'static,
     >,
 {
     /// Returns a reference to the [`EthApiNodeBackend`].
@@ -319,25 +314,33 @@ pub struct OpEthApiBuilder<NetworkT = Optimism> {
     /// Sequencer client, configured to forward submitted transactions to sequencer of given OP
     /// network.
     sequencer_url: Option<String>,
+    /// Headers to use for the sequencer client requests.
+    sequencer_headers: Vec<String>,
     /// Marker for network types.
     _nt: PhantomData<NetworkT>,
 }
 
 impl<NetworkT> Default for OpEthApiBuilder<NetworkT> {
     fn default() -> Self {
-        Self { sequencer_url: None, _nt: PhantomData }
+        Self { sequencer_url: None, sequencer_headers: Vec::new(), _nt: PhantomData }
     }
 }
 
 impl<NetworkT> OpEthApiBuilder<NetworkT> {
     /// Creates a [`OpEthApiBuilder`] instance from core components.
     pub const fn new() -> Self {
-        Self { sequencer_url: None, _nt: PhantomData }
+        Self { sequencer_url: None, sequencer_headers: Vec::new(), _nt: PhantomData }
     }
 
     /// With a [`SequencerClient`].
     pub fn with_sequencer(mut self, sequencer_url: Option<String>) -> Self {
         self.sequencer_url = sequencer_url;
+        self
+    }
+
+    /// With headers to use for the sequencer client requests.
+    pub fn with_sequencer_headers(mut self, sequencer_headers: Vec<String>) -> Self {
+        self.sequencer_headers = sequencer_headers;
         self
     }
 }
@@ -351,7 +354,7 @@ where
     type EthApi = OpEthApi<N, NetworkT>;
 
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
-        let Self { sequencer_url, .. } = self;
+        let Self { sequencer_url, sequencer_headers, .. } = self;
         let eth_api = reth_rpc::EthApiBuilder::new(
             ctx.components.provider().clone(),
             ctx.components.pool().clone(),
@@ -370,7 +373,7 @@ where
 
         let sequencer_client = if let Some(url) = sequencer_url {
             Some(
-                SequencerClient::new(&url)
+                SequencerClient::new_with_headers(&url, sequencer_headers)
                     .await
                     .wrap_err_with(|| "Failed to init sequencer client with: {url}")?,
             )
