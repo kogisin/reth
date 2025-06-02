@@ -3,7 +3,8 @@
 use crate::testsuite::{Environment, LatestBlockInfo};
 use alloy_primitives::{Bytes, B256, U256};
 use alloy_rpc_types_engine::{
-    payload::ExecutionPayloadEnvelopeV3, ForkchoiceState, PayloadAttributes, PayloadStatusEnum,
+    payload::ExecutionPayloadEnvelopeV3, ForkchoiceState, ForkchoiceUpdated, PayloadAttributes,
+    PayloadStatusEnum,
 };
 use alloy_rpc_types_eth::{Block, Header, Receipt, Transaction};
 use eyre::Result;
@@ -13,6 +14,99 @@ use reth_rpc_api::clients::{EngineApiClient, EthApiClient};
 use std::{future::Future, marker::PhantomData, time::Duration};
 use tokio::time::sleep;
 use tracing::debug;
+
+/// Validates a forkchoice update response and returns an error if invalid
+fn validate_fcu_response(response: &ForkchoiceUpdated, context: &str) -> Result<()> {
+    match &response.payload_status.status {
+        PayloadStatusEnum::Valid => {
+            debug!("{}: FCU accepted as valid", context);
+            Ok(())
+        }
+        PayloadStatusEnum::Invalid { validation_error } => {
+            Err(eyre::eyre!("{}: FCU rejected as invalid: {:?}", context, validation_error))
+        }
+        PayloadStatusEnum::Syncing => {
+            debug!("{}: FCU accepted, node is syncing", context);
+            Ok(())
+        }
+        PayloadStatusEnum::Accepted => {
+            debug!("{}: FCU accepted for processing", context);
+            Ok(())
+        }
+    }
+}
+
+/// Expects that the `ForkchoiceUpdated` response status is VALID.
+pub fn expect_fcu_valid(response: &ForkchoiceUpdated, context: &str) -> Result<()> {
+    match &response.payload_status.status {
+        PayloadStatusEnum::Valid => {
+            debug!("{}: FCU status is VALID as expected.", context);
+            Ok(())
+        }
+        other_status => {
+            Err(eyre::eyre!("{}: Expected FCU status VALID, but got {:?}", context, other_status))
+        }
+    }
+}
+
+/// Expects that the `ForkchoiceUpdated` response status is INVALID.
+pub fn expect_fcu_invalid(response: &ForkchoiceUpdated, context: &str) -> Result<()> {
+    match &response.payload_status.status {
+        PayloadStatusEnum::Invalid { validation_error } => {
+            debug!("{}: FCU status is INVALID as expected: {:?}", context, validation_error);
+            Ok(())
+        }
+        other_status => {
+            Err(eyre::eyre!("{}: Expected FCU status INVALID, but got {:?}", context, other_status))
+        }
+    }
+}
+
+/// Expects that the `ForkchoiceUpdated` response status is either SYNCING or ACCEPTED.
+pub fn expect_fcu_syncing_or_accepted(response: &ForkchoiceUpdated, context: &str) -> Result<()> {
+    match &response.payload_status.status {
+        PayloadStatusEnum::Syncing => {
+            debug!("{}: FCU status is SYNCING as expected (SYNCING or ACCEPTED).", context);
+            Ok(())
+        }
+        PayloadStatusEnum::Accepted => {
+            debug!("{}: FCU status is ACCEPTED as expected (SYNCING or ACCEPTED).", context);
+            Ok(())
+        }
+        other_status => Err(eyre::eyre!(
+            "{}: Expected FCU status SYNCING or ACCEPTED, but got {:?}",
+            context,
+            other_status
+        )),
+    }
+}
+
+/// Expects that the `ForkchoiceUpdated` response status is not SYNCING and not ACCEPTED.
+pub fn expect_fcu_not_syncing_or_accepted(
+    response: &ForkchoiceUpdated,
+    context: &str,
+) -> Result<()> {
+    match &response.payload_status.status {
+        PayloadStatusEnum::Valid => {
+            debug!("{}: FCU status is VALID as expected (not SYNCING or ACCEPTED).", context);
+            Ok(())
+        }
+        PayloadStatusEnum::Invalid { validation_error } => {
+            debug!(
+                "{}: FCU status is INVALID as expected (not SYNCING or ACCEPTED): {:?}",
+                context, validation_error
+            );
+            Ok(())
+        }
+        syncing_or_accepted_status @ (PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted) => {
+            Err(eyre::eyre!(
+                "{}: Expected FCU status not SYNCING or ACCEPTED (i.e., VALID or INVALID), but got {:?}",
+                context,
+                syncing_or_accepted_status
+            ))
+        }
+    }
+}
 
 /// An action that can be performed on an instance.
 ///
@@ -282,6 +376,9 @@ where
 
             debug!("FCU result: {:?}", fcu_result);
 
+            // validate the FCU status before proceeding
+            validate_fcu_response(&fcu_result, "GenerateNextPayload")?;
+
             let payload_id = if let Some(payload_id) = fcu_result.payload_id {
                 debug!("Received new payload ID: {:?}", payload_id);
                 payload_id
@@ -304,6 +401,9 @@ where
                 .await?;
 
                 debug!("Fresh FCU result: {:?}", fresh_fcu_result);
+
+                // validate the fresh FCU status
+                validate_fcu_response(&fresh_fcu_result, "GenerateNextPayload (fresh)")?;
 
                 if let Some(payload_id) = fresh_fcu_result.payload_id {
                     payload_id
@@ -400,6 +500,8 @@ where
                             "Client {}: Forkchoice update status: {:?}",
                             idx, resp.payload_status.status
                         );
+                        // validate that the forkchoice update was accepted
+                        validate_fcu_response(&resp, &format!("Client {idx}"))?;
                     }
                     Err(err) => {
                         return Err(eyre::eyre!(
@@ -594,12 +696,13 @@ where
         Box::pin(async move {
             for _ in 0..self.num_blocks {
                 // create a fresh sequence for each block to avoid state pollution
+                // Note: This produces blocks but does NOT make them canonical
+                // Use MakeCanonical action explicitly if canonicalization is needed
                 let mut sequence = Sequence::new(vec![
                     Box::new(PickNextBlockProducer::default()),
                     Box::new(GeneratePayloadAttributes::default()),
                     Box::new(GenerateNextPayload::default()),
                     Box::new(BroadcastNextNewPayload::default()),
-                    Box::new(BroadcastLatestForkchoice::default()),
                     Box::new(UpdateBlockInfo::default()),
                 ]);
                 sequence.execute(env).await?;
@@ -1000,6 +1103,31 @@ where
 
             debug!("Set reorg target to block {}", self.target_hash);
             Ok(())
+        })
+    }
+}
+
+/// Action that makes the current latest block canonical by broadcasting a forkchoice update
+#[derive(Debug, Default)]
+pub struct MakeCanonical {}
+
+impl MakeCanonical {
+    /// Create a new `MakeCanonical` action
+    pub const fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<Engine> Action<Engine> for MakeCanonical
+where
+    Engine: EngineTypes + PayloadTypes,
+    Engine::PayloadAttributes: From<PayloadAttributes> + Clone,
+    Engine::ExecutionPayloadEnvelopeV3: Into<ExecutionPayloadEnvelopeV3>,
+{
+    fn execute<'a>(&'a mut self, env: &'a mut Environment<Engine>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let mut broadcast_action = BroadcastLatestForkchoice::default();
+            broadcast_action.execute(env).await
         })
     }
 }
