@@ -2,12 +2,13 @@
 
 use core::fmt::Debug;
 
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 use alloy_primitives::{
     map::{HashMap, HashSet},
     B256,
 };
 use alloy_trie::{BranchNodeCompact, TrieMask};
+use either::Either;
 use reth_execution_errors::SparseTrieResult;
 use reth_trie_common::{Nibbles, TrieNode};
 
@@ -18,23 +19,7 @@ use crate::blinded::BlindedProvider;
 /// This trait abstracts over different sparse trie implementations (serial vs parallel)
 /// while providing a unified interface for the core trie operations needed by the
 /// [`crate::SparseTrie`] enum.
-pub trait SparseTrieInterface: Default + Debug + Send + Sync {
-    /// Creates a new revealed sparse trie from the given root node.
-    ///
-    /// This function initializes the internal structures and then reveals the root.
-    /// It is a convenient method to create a trie when you already have the root node available.
-    ///
-    /// # Arguments
-    ///
-    /// * `root` - The root node of the trie
-    /// * `masks` - Trie masks for root branch node
-    /// * `retain_updates` - Whether to track updates
-    ///
-    /// # Returns
-    ///
-    /// Self if successful, or an error if revealing fails.
-    fn from_root(root: TrieNode, masks: TrieMasks, retain_updates: bool) -> SparseTrieResult<Self>;
-
+pub trait SparseTrieInterface: Sized + Debug + Send + Sync {
     /// Configures the trie to have the given root node revealed.
     ///
     /// # Arguments
@@ -201,6 +186,11 @@ pub trait SparseTrieInterface: Default + Debug + Send + Sync {
         expected_value: Option<&Vec<u8>>,
     ) -> Result<LeafLookup, LeafLookupError>;
 
+    /// Returns a reference to the current sparse trie updates.
+    ///
+    /// If no updates have been made/recorded, returns an empty update set.
+    fn updates_ref(&self) -> Cow<'_, SparseTrieUpdates>;
+
     /// Consumes and returns the currently accumulated trie updates.
     ///
     /// This is useful when you want to apply the updates to an external database
@@ -300,8 +290,132 @@ pub enum LeafLookup {
     /// Leaf exists with expected value.
     Exists,
     /// Leaf does not exist (exclusion proof found).
-    NonExistent {
-        /// Path where the search diverged from the target path.
-        diverged_at: Nibbles,
-    },
+    NonExistent,
+}
+
+impl<A, B> SparseTrieInterface for Either<A, B>
+where
+    A: SparseTrieInterface,
+    B: SparseTrieInterface,
+{
+    fn with_root(
+        self,
+        root: TrieNode,
+        masks: TrieMasks,
+        retain_updates: bool,
+    ) -> SparseTrieResult<Self> {
+        match self {
+            Self::Left(trie) => trie.with_root(root, masks, retain_updates).map(Self::Left),
+            Self::Right(trie) => trie.with_root(root, masks, retain_updates).map(Self::Right),
+        }
+    }
+
+    fn with_updates(self, retain_updates: bool) -> Self {
+        match self {
+            Self::Left(trie) => Self::Left(trie.with_updates(retain_updates)),
+            Self::Right(trie) => Self::Right(trie.with_updates(retain_updates)),
+        }
+    }
+
+    fn reserve_nodes(&mut self, additional: usize) {
+        match self {
+            Self::Left(trie) => trie.reserve_nodes(additional),
+            Self::Right(trie) => trie.reserve_nodes(additional),
+        }
+    }
+
+    fn reveal_node(
+        &mut self,
+        path: Nibbles,
+        node: TrieNode,
+        masks: TrieMasks,
+    ) -> SparseTrieResult<()> {
+        match self {
+            Self::Left(trie) => trie.reveal_node(path, node, masks),
+            Self::Right(trie) => trie.reveal_node(path, node, masks),
+        }
+    }
+
+    fn update_leaf<P: BlindedProvider>(
+        &mut self,
+        full_path: Nibbles,
+        value: Vec<u8>,
+        provider: P,
+    ) -> SparseTrieResult<()> {
+        match self {
+            Self::Left(trie) => trie.update_leaf(full_path, value, provider),
+            Self::Right(trie) => trie.update_leaf(full_path, value, provider),
+        }
+    }
+
+    fn remove_leaf<P: BlindedProvider>(
+        &mut self,
+        full_path: &Nibbles,
+        provider: P,
+    ) -> SparseTrieResult<()> {
+        match self {
+            Self::Left(trie) => trie.remove_leaf(full_path, provider),
+            Self::Right(trie) => trie.remove_leaf(full_path, provider),
+        }
+    }
+
+    fn root(&mut self) -> B256 {
+        match self {
+            Self::Left(trie) => trie.root(),
+            Self::Right(trie) => trie.root(),
+        }
+    }
+
+    fn update_subtrie_hashes(&mut self) {
+        match self {
+            Self::Left(trie) => trie.update_subtrie_hashes(),
+            Self::Right(trie) => trie.update_subtrie_hashes(),
+        }
+    }
+
+    fn get_leaf_value(&self, full_path: &Nibbles) -> Option<&Vec<u8>> {
+        match self {
+            Self::Left(trie) => trie.get_leaf_value(full_path),
+            Self::Right(trie) => trie.get_leaf_value(full_path),
+        }
+    }
+
+    fn find_leaf(
+        &self,
+        full_path: &Nibbles,
+        expected_value: Option<&Vec<u8>>,
+    ) -> Result<LeafLookup, LeafLookupError> {
+        match self {
+            Self::Left(trie) => trie.find_leaf(full_path, expected_value),
+            Self::Right(trie) => trie.find_leaf(full_path, expected_value),
+        }
+    }
+
+    fn take_updates(&mut self) -> SparseTrieUpdates {
+        match self {
+            Self::Left(trie) => trie.take_updates(),
+            Self::Right(trie) => trie.take_updates(),
+        }
+    }
+
+    fn wipe(&mut self) {
+        match self {
+            Self::Left(trie) => trie.wipe(),
+            Self::Right(trie) => trie.wipe(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Left(trie) => trie.clear(),
+            Self::Right(trie) => trie.clear(),
+        }
+    }
+
+    fn updates_ref(&self) -> Cow<'_, SparseTrieUpdates> {
+        match self {
+            Self::Left(trie) => trie.updates_ref(),
+            Self::Right(trie) => trie.updates_ref(),
+        }
+    }
 }
