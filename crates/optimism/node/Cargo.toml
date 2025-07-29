@@ -13,7 +13,8 @@ workspace = true
 [dependencies]
 # reth
 reth-chainspec.workspace = true
-reth-primitives-traits.workspace = true
+## ensure secp256k1 recovery with rayon support is activated
+reth-primitives-traits = { workspace = true, features = ["secp256k1", "rayon"] }
 reth-payload-builder.workspace = true
 reth-consensus.workspace = true
 reth-node-api.workspace = true
@@ -29,6 +30,7 @@ reth-tasks = { workspace = true, optional = true }
 reth-trie-common.workspace = true
 reth-node-core.workspace = true
 reth-rpc-engine-api.workspace = true
+reth-engine-primitives.workspace = true
 reth-engine-local = { workspace = true, features = ["op"] }
 reth-rpc-api.workspace = true
 
@@ -42,6 +44,11 @@ reth-optimism-chainspec.workspace = true
 reth-optimism-consensus = { workspace = true, features = ["std"] }
 reth-optimism-forks.workspace = true
 reth-optimism-primitives = { workspace = true, features = ["serde", "serde-bincode-compat", "reth-codec"] }
+
+# revm with required optimism features
+# Note: this must be kept to ensure all features are properly enabled/forwarded
+revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg"] }
+op-revm.workspace = true
 
 # ethereum
 alloy-primitives.workspace = true
@@ -65,7 +72,6 @@ serde_json = { workspace = true, optional = true }
 [dev-dependencies]
 reth-optimism-node = { workspace = true, features = ["test-utils"] }
 reth-db = { workspace = true, features = ["op"] }
-reth-node-core.workspace = true
 reth-node-builder = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-tasks.workspace = true
@@ -73,10 +79,7 @@ reth-payload-util.workspace = true
 reth-payload-validator.workspace = true
 reth-revm = { workspace = true, features = ["std"] }
 
-alloy-primitives.workspace = true
-op-alloy-consensus.workspace = true
 alloy-network.workspace = true
-alloy-consensus.workspace = true
 futures.workspace = true
 alloy-eips.workspace = true
 
@@ -86,6 +89,7 @@ asm-keccak = [
     "alloy-primitives/asm-keccak",
     "reth-optimism-node/asm-keccak",
     "reth-node-core/asm-keccak",
+    "revm/asm-keccak",
 ]
 js-tracer = ["reth-node-builder/js-tracer"]
 test-utils = [
