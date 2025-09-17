@@ -10,7 +10,7 @@ use crate::tree::{
 };
 use alloy_evm::Database;
 use alloy_primitives::{keccak256, map::B256Set, B256};
-use metrics::{Gauge, Histogram};
+use metrics::{Counter, Gauge, Histogram};
 use reth_evm::{execute::ExecutableTxFor, ConfigureEvm, Evm, EvmFor, SpecFor};
 use reth_metrics::Metrics;
 use reth_primitives_traits::{NodePrimitives, SignedTransaction};
@@ -132,21 +132,30 @@ where
     /// Save the state to the shared cache for the given block.
     fn save_cache(self, state: BundleState) {
         let start = Instant::now();
-        let cache = SavedCache::new(
-            self.ctx.env.hash,
-            self.ctx.cache.clone(),
-            self.ctx.cache_metrics.clone(),
-        );
-        if cache.cache().insert_state(&state).is_err() {
-            return
-        }
 
-        cache.update_metrics();
+        // Precompute outside the lock
+        let hash = self.ctx.env.hash;
+        let caches = self.ctx.cache.clone();
+        let metrics = self.ctx.cache_metrics.clone();
 
-        debug!(target: "engine::caching", "Updated state caches");
+        // Perform all cache operations atomically under the lock
+        self.execution_cache.update_with_guard(|cached| {
+            let cache = SavedCache::new(hash, caches, metrics);
 
-        // update the cache for the executed block
-        self.execution_cache.save_cache(cache);
+            // Insert state into cache while holding the lock
+            if cache.cache().insert_state(&state).is_err() {
+                // Clear the cache on error to prevent having a polluted cache
+                *cached = None;
+                return;
+            }
+
+            cache.update_metrics();
+            debug!(target: "engine::caching", "Updated state caches");
+
+            // Replace the shared cache with the new one; the previous cache (if any) is dropped.
+            *cached = Some(cache);
+        });
+
         self.ctx.metrics.cache_saving_duration.set(start.elapsed().as_secs_f64());
     }
 
@@ -297,8 +306,8 @@ where
     /// Returns `None` if executing the transactions failed to a non Revert error.
     /// Returns the touched+modified state of the transaction.
     ///
-    /// Note: Since here are no ordering guarantees this won't the state the txs produce when
-    /// executed sequentially.
+    /// Note: There are no ordering guarantees; this does not reflect the state produced by
+    /// sequential execution.
     fn transact_batch(
         self,
         txs: mpsc::Receiver<impl ExecutableTxFor<Evm>>,
@@ -321,13 +330,16 @@ where
                 Ok(res) => res,
                 Err(err) => {
                     trace!(
-                        target: "engine::tree",
+                        target: "engine::tree::prewarm",
                         %err,
                         tx_hash=%tx.tx().tx_hash(),
                         sender=%tx.signer(),
                         "Error when executing prewarm transaction",
                     );
-                    return
+                    // Track transaction execution errors
+                    metrics.transaction_errors.increment(1);
+                    // skip error because we can ignore these errors and continue with the next tx
+                    continue
                 }
             };
             metrics.execution_duration.record(start.elapsed());
@@ -417,4 +429,6 @@ pub(crate) struct PrewarmMetrics {
     pub(crate) prefetch_storage_targets: Histogram,
     /// A histogram of duration for cache saving
     pub(crate) cache_saving_duration: Gauge,
+    /// Counter for transaction execution errors during prewarming
+    pub(crate) transaction_errors: Counter,
 }
