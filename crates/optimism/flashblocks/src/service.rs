@@ -6,8 +6,10 @@ use crate::{
 use alloy_eips::eip2718::WithEncoded;
 use alloy_primitives::B256;
 use futures_util::{FutureExt, Stream, StreamExt};
+use metrics::Histogram;
 use reth_chain_state::{CanonStateNotification, CanonStateNotifications, CanonStateSubscriptions};
 use reth_evm::ConfigureEvm;
+use reth_metrics::Metrics;
 use reth_primitives_traits::{
     AlloyBlockHeader, BlockTy, HeaderTy, NodePrimitives, ReceiptTy, Recovered,
 };
@@ -45,6 +47,7 @@ pub struct FlashBlockService<
     /// fb received on top of the same block. Avoid redundant I/O across multiple executions
     /// within the same block.
     cached_state: Option<(B256, CachedReads)>,
+    metrics: FlashBlockServiceMetrics,
 }
 
 impl<N, S, EvmConfig, Provider> FlashBlockService<N, S, EvmConfig, Provider>
@@ -77,6 +80,7 @@ where
             spawner,
             job: None,
             cached_state: None,
+            metrics: FlashBlockServiceMetrics::default(),
         }
     }
 
@@ -131,8 +135,25 @@ where
 
     /// Takes out `current` [`PendingBlock`] if `state` is not preceding it.
     fn on_new_tip(&mut self, state: CanonStateNotification<N>) -> Option<PendingBlock<N>> {
-        let latest = state.tip_checked()?.hash();
-        self.current.take_if(|current| current.parent_hash() != latest)
+        let tip = state.tip_checked()?;
+        let tip_hash = tip.hash();
+        let current = self.current.take_if(|current| current.parent_hash() != tip_hash);
+
+        // Prefill the cache with state from the new canonical tip, similar to payload/basic
+        let mut cached = CachedReads::default();
+        let committed = state.committed();
+        let new_execution_outcome = committed.execution_outcome();
+        for (addr, acc) in new_execution_outcome.bundle_accounts_iter() {
+            if let Some(info) = acc.info.clone() {
+                // Pre-cache existing accounts and their storage (only changed accounts/storage)
+                let storage =
+                    acc.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
+                cached.insert_account(addr, info, storage);
+            }
+        }
+        self.cached_state = Some((tip_hash, cached));
+
+        current
     }
 }
 
@@ -180,11 +201,13 @@ where
                         this.cached_state = Some((new_pending.parent_hash(), cached_reads));
                         this.rebuild = false;
 
+                        let elapsed = now.elapsed();
+                        this.metrics.execution_duration.record(elapsed.as_secs_f64());
                         trace!(
                             parent_hash = %new_pending.block().parent_hash(),
                             block_number = new_pending.block().number(),
                             flash_blocks = this.blocks.count(),
-                            elapsed = ?now.elapsed(),
+                            ?elapsed,
                             "Built new block with flashblocks"
                         );
 
@@ -203,10 +226,15 @@ where
             // consume new flashblocks while they're ready
             while let Poll::Ready(Some(result)) = this.rx.poll_next_unpin(cx) {
                 match result {
-                    Ok(flashblock) => match this.blocks.insert(flashblock) {
-                        Ok(_) => this.rebuild = true,
-                        Err(err) => debug!(%err, "Failed to prepare flashblock"),
-                    },
+                    Ok(flashblock) => {
+                        if flashblock.index == 0 {
+                            this.metrics.last_flashblock_length.record(this.blocks.count() as f64);
+                        }
+                        match this.blocks.insert(flashblock) {
+                            Ok(_) => this.rebuild = true,
+                            Err(err) => debug!(%err, "Failed to prepare flashblock"),
+                        }
+                    }
                     Err(err) => return Poll::Ready(Some(Err(err))),
                 }
             }
@@ -255,3 +283,12 @@ where
 
 type BuildJob<N> =
     (Instant, oneshot::Receiver<eyre::Result<Option<(PendingBlock<N>, CachedReads)>>>);
+
+#[derive(Metrics)]
+#[metrics(scope = "flashblock_service")]
+struct FlashBlockServiceMetrics {
+    /// The last complete length of flashblocks per block.
+    last_flashblock_length: Histogram,
+    /// The duration applying flashblock state changes in seconds.
+    execution_duration: Histogram,
+}
