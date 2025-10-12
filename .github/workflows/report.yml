@@ -2,7 +2,7 @@ name: report.yml
 
 on:
   schedule:
-    - cron: "7 7 * * *" # ежедневно 07:07 UTC
+    - cron: "7 7 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -71,15 +71,33 @@ jobs:
           echo "json=$GITHUB_WORKSPACE/lychee.json" >> "$GITHUB_OUTPUT"
           echo "report=$GITHUB_WORKSPACE/report.txt" >> "$GITHUB_OUTPUT"
 
-      # -------- 2) Устанавливаем lychee через Cargo --------
-      - name: Install lychee via Cargo
+      # ---------- build lychee with JSON support ----------
+      - name: Install lychee (from source with JSON)
+        id: lychee_build
+        continue-on-error: true
         run: |
+          set -e
           sudo apt-get update -y
           sudo apt-get install -y jq curl rustc cargo
-          cargo install lychee
+          cargo install lychee --locked --force --features json
+          lychee --version || true
 
-      # -------- 3) Проверка ссылок --------
-      - name: Run lychee check
+      # ---------- fallback prebuilt binary ----------
+      - name: Install lychee (fallback binary)
+        if: steps.lychee_build.outcome != 'success'
+        run: |
+          set -e
+          sudo apt-get install -y jq curl file
+          REL_JSON=$(curl -s https://api.github.com/repos/lycheeverse/lychee/releases/latest)
+          ASSET=$(echo "$REL_JSON" | jq -r '.assets[] | select(.name|test("x86_64-unknown-linux-gnu.*\\.tar\\.gz$")) | .browser_download_url' | head -n1)
+          curl -L "$ASSET" -o lychee.tgz
+          tar -xzf lychee.tgz
+          chmod +x lychee
+          sudo mv lychee /usr/local/bin/lychee
+          lychee --version || true
+
+      # ---------- run check ----------
+      - name: Run lychee link checker
         id: lychee
         shell: bash
         run: |
@@ -88,10 +106,10 @@ jobs:
           lychee \
             --max-concurrency 8 \
             --no-progress \
-            --timeout 20 \
+            --timeout 25 \
             --retry-wait-time 2 \
             --max-retries 2 \
-            --header user-agent="GitHubAction-lychee" \
+            --header "User-agent: GitHubAction-lychee" \
             --accept 200,429 \
             --exclude "http://localhost(:[0-9]+)?/" \
             --exclude "enode://*" \
@@ -99,13 +117,20 @@ jobs:
             --verbose \
             --format json \
             --output "$JSON" \
-            "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
-          STATUS=$?
-          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+            "**/*.md" "**/*.mdx" "**/*.rs" "**/*.tsx" "**/*.ts" > lychee.log 2>&1
+
+          echo "Lychee output preview (first 30 lines):"
+          head -n 30 lychee.log || true
+
+          if [ -s "$JSON" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
           set -e
 
-      # -------- 4) Собираем отчёт --------
-      - name: Build broken-links report
+      # ---------- build human-readable report ----------
+      - name: Build report
         id: build
         shell: bash
         run: |
@@ -145,7 +170,7 @@ jobs:
               end
           ' "$JSON" > "$REPORT"
 
-      # -------- 5) Отображаем и шлём --------
+      # ---------- GitHub Summary ----------
       - name: Publish GitHub Summary
         shell: bash
         run: |
@@ -160,14 +185,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: lychee-report
-          path: |
-            ${{ steps.paths.outputs.json }}
-            ${{ steps.paths.outputs.report }}
-
+      # ---------- Telegram ----------
       - name: Send Telegram
         if: always()
         env:
