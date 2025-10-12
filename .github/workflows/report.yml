@@ -1,68 +1,75 @@
-name: Daily Fork Sync + Link Check + TG Report
+name: Daily Sync -> Link Check -> TG (admin only)
 
 on:
   schedule:
-    - cron: "17 7 * * *"      # каждый день 07:07 UTC
-  workflow_dispatch: {}       # можно вручную запустить
+    - cron: "7 7 * * *"         # ежедневно в 07:07 UTC
+  workflow_dispatch: {}          # ручной запуск при необходимости
 
 permissions:
-  contents: write             # чтобы пушить апстрим в форк
+  contents: write                # нужно, чтобы пушить в сам форк
 
 env:
-  UPSTREAM: paradigmxyz/reth   # 👉 исходный репозиторий (укажи точный)
-  BRANCH: main                 # ветка для синка
-  TELEGRAM_API: https://api.telegram.org
+  # Укажи исходный (апстрим) репозиторий. При необходимости измени на реальный upstream.
+  UPSTREAM: paradigmxyz/reth
+  BRANCH: main
 
 jobs:
   sync-and-check:
     runs-on: ubuntu-latest
 
     steps:
-      # === 1. СИНХРОНИЗАЦИЯ ФОРКА ===
+      # ========== 1) СИНХРОНИЗАЦИЯ ФОРКА (FAST-FORWARD, без переписывания истории) ==========
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ env.BRANCH }}
 
-      - name: Configure git
+      - name: Configure git bot identity
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Add upstream and fetch
+      - name: Add upstream & fetch
         run: |
-          git remote add upstream https://github.com/${{ env.UPSTREAM }}.git || true
+          git remote add upstream "https://github.com/${{ env.UPSTREAM }}.git" || true
           git fetch upstream --prune
+          git fetch origin  --prune
 
-      - name: Rebase from upstream
+      - name: Fast-forward merge from upstream (no history rewrite)
         id: sync
         shell: bash
         run: |
           set -e
           git checkout "${BRANCH}"
-          git fetch origin "${BRANCH}" || true
-          read L R < <(git rev-list --left-right --count "origin/${BRANCH}...upstream/${BRANCH}")
-          echo "origin vs upstream: left=$L right=$R"
-          if [ "$R" -gt 0 ]; then
-            echo "Upstream ahead — syncing..."
-            git reset --hard "origin/${BRANCH}" || true
-            git rebase "upstream/${BRANCH}"
-            git push origin "HEAD:${BRANCH}" --force-with-lease
-            echo "pushed=true" >> $GITHUB_OUTPUT
+
+          # Можно ли сделать fast-forward?
+          if git merge-base --is-ancestor HEAD "upstream/${BRANCH}"; then
+            BEFORE=$(git rev-parse HEAD)
+            git merge --ff-only "upstream/${BRANCH}"
+            AFTER=$(git rev-parse HEAD)
+            if [ "$BEFORE" != "$AFTER" ]; then
+              git push origin "HEAD:${BRANCH}"
+              echo "synced=true" >> $GITHUB_OUTPUT
+            else
+              echo "synced=false" >> $GITHUB_OUTPUT
+            fi
           else
-            echo "No upstream updates"
-            echo "pushed=false" >> $GITHUB_OUTPUT
+            echo "synced=false" >> $GITHUB_OUTPUT
+            echo "Fast-forward not possible (fork has own commits ahead). Skipping auto-sync."
           fi
 
-      # === 2. ПРОВЕРКИ ===
-      - name: Checkout repo again (post-sync)
+      # ========== 2) ПРОВЕРКА ССЫЛОК (LYCHEE) ==========
+      - name: Re-checkout repo (post-sync)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.BRANCH }}
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Run Lychee link checker
+      - name: Check links with lychee (JSON report)
         uses: lycheeverse/lychee-action@v2.2.0
         with:
           args: >-
@@ -76,17 +83,20 @@ jobs:
             --output lychee.json
             "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
 
-      - name: Extract broken links
+      - name: Extract broken links (URL only)
         id: extract
         shell: bash
         run: |
           test -f lychee.json || echo '{}' > lychee.json
-          jq -r '(.fail_map // {}) | to_entries[] | .key' lychee.json | sort -u > bad_links.txt || true
+          # В lychee.json "fail_map" = { "url": [ { source_file, ..}, ... ], ... }
+          jq -r '(.fail_map // {}) | to_entries[] | .key' lychee.json \
+            | sort -u > bad_links.txt || true
           COUNT=$(wc -l < bad_links.txt | tr -d ' ')
           echo "count=$COUNT" >> $GITHUB_OUTPUT
-          cat bad_links.txt
+          echo "Broken links: $COUNT"
+          head -n 50 bad_links.txt || true
 
-      - name: Upload report artifact
+      - name: Upload artifacts (optional)
         uses: actions/upload-artifact@v4
         with:
           name: lychee-report
@@ -94,23 +104,27 @@ jobs:
             lychee.json
             bad_links.txt
 
-      # === 3. ОТПРАВКА ОТЧЁТА В TELEGRAM ===
-      - name: Send Telegram report
+      # ========== 3) ОТПРАВКА ОТЧЁТА В ТЕЛЕГРАМ (ТОЛЬКО АДМИНУ) ==========
+      - name: Send Telegram report to admin only
         if: always()
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
-          COUNT:    ${{ steps.extract.outputs.count }}
-          PUSHED:   ${{ steps.sync.outputs.pushed }}
+          ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}   # твой личный chat_id
+          COUNT:   ${{ steps.extract.outputs.count }}
+          SYNCED:  ${{ steps.sync.outputs.synced }}
         shell: bash
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ -s bad_links.txt ]; then
-            TEXT="🟥 *reth check report*\n\n*Upstream synced:* \`${PUSHED}\`\n*Broken links:* ${COUNT}\n[View run](${RUN_URL})\n\n$(head -n 40 bad_links.txt)"
+            # Чтобы не уехать в лимиты Телеги — отправим первые 100 ссылок, остальное в артефакте/по ссылке на ран
+            LINKS=$(head -n 100 bad_links.txt | sed 's/"/\\"/g')
+            TEXT="Broken links: ${COUNT}\nUpstream synced: ${SYNCED:-false}\nRun: ${RUN_URL}\n\n${LINKS}"
           else
-            TEXT="✅ *reth check report*\n\n*Upstream synced:* \`${PUSHED}\`\nAll links OK.\n[View run](${RUN_URL})"
+            TEXT="All links OK\nUpstream synced: ${SYNCED:-false}\nRun: ${RUN_URL}"
           fi
+
+          # без parse_mode, чтобы не ломать формат URL спецсимволами
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -H 'content-type: application/json' \
-            -d "$(jq -n --arg chat "$TG_CHAT" --arg txt "$TEXT" \
-                  '{chat_id:$chat, parse_mode:"Markdown", disable_web_page_preview:true, text:$txt }')"
+            -d "$(jq -n --arg chat "$ADMIN_ID" --arg txt "$TEXT" \
+                  '{chat_id:$chat, text:$txt, disable_web_page_preview:true }')"
