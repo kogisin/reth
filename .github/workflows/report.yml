@@ -1,0 +1,116 @@
+name: Daily Fork Sync + Link Check + TG Report
+
+on:
+  schedule:
+    - cron: "17 7 * * *"      # каждый день 07:07 UTC
+  workflow_dispatch: {}       # можно вручную запустить
+
+permissions:
+  contents: write             # чтобы пушить апстрим в форк
+
+env:
+  UPSTREAM: paradigmxyz/reth   # 👉 исходный репозиторий (укажи точный)
+  BRANCH: main                 # ветка для синка
+  TELEGRAM_API: https://api.telegram.org
+
+jobs:
+  sync-and-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      # === 1. СИНХРОНИЗАЦИЯ ФОРКА ===
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.BRANCH }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM }}.git || true
+          git fetch upstream --prune
+
+      - name: Rebase from upstream
+        id: sync
+        shell: bash
+        run: |
+          set -e
+          git checkout "${BRANCH}"
+          git fetch origin "${BRANCH}" || true
+          read L R < <(git rev-list --left-right --count "origin/${BRANCH}...upstream/${BRANCH}")
+          echo "origin vs upstream: left=$L right=$R"
+          if [ "$R" -gt 0 ]; then
+            echo "Upstream ahead — syncing..."
+            git reset --hard "origin/${BRANCH}" || true
+            git rebase "upstream/${BRANCH}"
+            git push origin "HEAD:${BRANCH}" --force-with-lease
+            echo "pushed=true" >> $GITHUB_OUTPUT
+          else
+            echo "No upstream updates"
+            echo "pushed=false" >> $GITHUB_OUTPUT
+          fi
+
+      # === 2. ПРОВЕРКИ ===
+      - name: Checkout repo again (post-sync)
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run Lychee link checker
+        uses: lycheeverse/lychee-action@v2.2.0
+        with:
+          args: >-
+            --no-progress
+            --accept 200,429
+            --exclude "http://localhost(:[0-9]+)?/"
+            --exclude "enode://*"
+            --exclude "http://127.0.0.1(:[0-9]+)?/"
+            --verbose
+            --format json
+            --output lychee.json
+            "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
+
+      - name: Extract broken links
+        id: extract
+        shell: bash
+        run: |
+          test -f lychee.json || echo '{}' > lychee.json
+          jq -r '(.fail_map // {}) | to_entries[] | .key' lychee.json | sort -u > bad_links.txt || true
+          COUNT=$(wc -l < bad_links.txt | tr -d ' ')
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          cat bad_links.txt
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lychee-report
+          path: |
+            lychee.json
+            bad_links.txt
+
+      # === 3. ОТПРАВКА ОТЧЁТА В TELEGRAM ===
+      - name: Send Telegram report
+        if: always()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          COUNT:    ${{ steps.extract.outputs.count }}
+          PUSHED:   ${{ steps.sync.outputs.pushed }}
+        shell: bash
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ -s bad_links.txt ]; then
+            TEXT="🟥 *reth check report*\n\n*Upstream synced:* \`${PUSHED}\`\n*Broken links:* ${COUNT}\n[View run](${RUN_URL})\n\n$(head -n 40 bad_links.txt)"
+          else
+            TEXT="✅ *reth check report*\n\n*Upstream synced:* \`${PUSHED}\`\nAll links OK.\n[View run](${RUN_URL})"
+          fi
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -H 'content-type: application/json' \
+            -d "$(jq -n --arg chat "$TG_CHAT" --arg txt "$TEXT" \
+                  '{chat_id:$chat, parse_mode:"Markdown", disable_web_page_preview:true, text:$txt }')"
