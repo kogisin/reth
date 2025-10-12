@@ -2,14 +2,14 @@ name: report.yml
 
 on:
   schedule:
-    - cron: "7 7 * * *"
+    - cron: "7 7 * * *"    # ежедневно 07:07 UTC
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
 env:
-  UPSTREAM: paradigmxyz/reth
+  UPSTREAM: paradigmxyz/reth    # поменяй при необходимости
   BRANCH: main
 
 jobs:
@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ---------- 1) SYNC ----------
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
@@ -71,18 +72,19 @@ jobs:
           echo "json=$GITHUB_WORKSPACE/lychee.json" >> "$GITHUB_OUTPUT"
           echo "report=$GITHUB_WORKSPACE/report.txt" >> "$GITHUB_OUTPUT"
 
-      # ---------- build lychee with JSON support ----------
-      - name: Install lychee (from source with JSON)
+      # ---------- 2) Lychee с JSON (build из source) ----------
+      - name: Install lychee (from source with JSON support)
         id: lychee_build
         continue-on-error: true
         run: |
           set -e
           sudo apt-get update -y
           sudo apt-get install -y jq curl rustc cargo
+          # feature "json" включает формат JSON в бинарнике
           cargo install lychee --locked --force --features json
           lychee --version || true
 
-      # ---------- fallback prebuilt binary ----------
+      # ---------- fallback: предсобранный бинарь ----------
       - name: Install lychee (fallback binary)
         if: steps.lychee_build.outcome != 'success'
         run: |
@@ -96,23 +98,25 @@ jobs:
           sudo mv lychee /usr/local/bin/lychee
           lychee --version || true
 
-      # ---------- run check ----------
+      # ---------- 3) Запуск проверки с жёсткими фильтрами ----------
       - name: Run lychee link checker
         id: lychee
         shell: bash
         run: |
           set +e
           JSON="${{ steps.paths.outputs.json }}"
+          CACHE="$RUNNER_TEMP/lychee-cache-$(date +%s).db"
+
           lychee \
-            --max-concurrency 8 \
             --no-progress \
-            --no-cache \
             --no-git-ignore \
+            --include-fragments \
+            --cache "$CACHE" \
             --max-concurrency 16 \
-            --timeout 25 \
+            --timeout 30 \
             --retry-wait-time 3 \
-            --max-retries 2 \
-            --header "User-agent: GitHubAction-lychee" \
+            --max-retries 3 \
+            --header "User-Agent: GitHubAction-lychee" \
             --accept 200,429 \
             --exclude "http://localhost(:[0-9]+)?/" \
             --exclude "enode://*" \
@@ -120,10 +124,11 @@ jobs:
             --verbose \
             --format json \
             --output "$JSON" \
-            "**/*.md" "**/*.mdx" "**/*.rs" "**/*.tsx" "**/*.ts" > lychee.log 2>&1
+            . \
+            > lychee.log 2>&1
 
-          echo "Lychee output preview (first 30 lines):"
-          head -n 30 lychee.log || true
+          echo "Lychee output preview (first 60 lines):"
+          head -n 60 lychee.log || true
 
           if [ -s "$JSON" ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
@@ -132,7 +137,7 @@ jobs:
           fi
           set -e
 
-      # ---------- build human-readable report ----------
+      # ---------- 4) Строим человекочитаемый отчёт (только fail_map) ----------
       - name: Build report
         id: build
         shell: bash
@@ -173,7 +178,7 @@ jobs:
               end
           ' "$JSON" > "$REPORT"
 
-      # ---------- GitHub Summary ----------
+      # ---------- 5) Summary + артефакты + Telegram ----------
       - name: Publish GitHub Summary
         shell: bash
         run: |
@@ -188,7 +193,15 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- Telegram ----------
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lychee-report
+          path: |
+            ${{ steps.paths.outputs.json }}
+            ${{ steps.paths.outputs.report }}
+            lychee.log
+
       - name: Send Telegram
         if: always()
         env:
