@@ -2,7 +2,7 @@ name: report.yml
 
 on:
   schedule:
-    - cron: "7 7 * * *"
+    - cron: "7 7 * * *"      # ежедневно 07:07 UTC
   workflow_dispatch: {}
 
 permissions:
@@ -56,34 +56,42 @@ jobs:
             echo "Fast-forward not possible; skipping auto-sync."
           fi
 
-      # ---------- 2) LYCHEE ----------
-      - name: Re-checkout repo (post-sync)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ env.BRANCH }}
+      # ---------- 2) LYCHEE CLI (без action, полный контроль) ----------
+      - name: Install tools (jq + lychee)
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+          # ставим последнюю стабильную (под x86_64 linux)
+          VER=$(curl -s https://api.github.com/repos/lycheeverse/lychee/releases/latest | jq -r .tag_name)
+          curl -L "https://github.com/lycheeverse/lychee/releases/download/${VER}/lychee-${VER}-x86_64-unknown-linux-gnu.tar.gz" -o lychee.tgz
+          tar -xzf lychee.tgz
+          sudo mv lychee /usr/local/bin/lychee
+          lychee --version
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Run lychee (JSON)
-        id: lychee
+      - name: Run lychee -> lychee.json
+        id: run_lychee
+        shell: bash
         continue-on-error: true
-        uses: lycheeverse/lychee-action@v2.2.0
-        with:
-          args: >-
-            --no-progress
-            --accept 200,429
-            --exclude "http://localhost(:[0-9]+)?/"
-            --exclude "enode://*"
-            --exclude "http://127.0.0.1(:[0-9]+)?/"
-            --verbose
-            --format json
-            "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
-          output: lychee.json
+        run: |
+          set -o pipefail
+          # ВАЖНО: полностью управляем входами/выходом
+          lychee \
+            --no-progress \
+            --accept 200,429 \
+            --exclude "http://localhost(:[0-9]+)?/" \
+            --exclude "enode://*" \
+            --exclude "http://127.0.0.1(:[0-9]+)?/" \
+            --verbose \
+            --format json \
+            "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts" \
+            > lychee.json
+          # покажем ключи верхнего уровня для дебага
+          jq 'keys' lychee.json || true
 
-      # ---------- 3) Построение отчёта ТОЛЬКО из fail_map ----------
-      - name: Build report (only broken links grouped by file)
+      # ---------- 3) Формируем ОТЧЁТ ТОЛЬКО из fail_map ----------
+      - name: Build report (only broken links, grouped by file)
         id: build
         shell: bash
         run: |
@@ -91,46 +99,51 @@ jobs:
           : > report.txt
 
           if [ ! -s "$OUT" ]; then
-            echo "Lychee did not produce report (outcome=${{ steps.lychee.outcome }})" > report.txt
+            echo "Lychee JSON is missing (outcome=${{ steps.run_lychee.outcome }})" > report.txt
             echo "broken=0" >> $GITHUB_OUTPUT
-          else
-            # количество битых ссылок = сумма длин массивов в fail_map
-            ERR=$(jq '(.fail_map // {}) | to_entries | map(.value | length) | add // 0' "$OUT")
-            echo "broken=$ERR" >> $GITHUB_OUTPUT
-
-            # плоская таблица только из fail_map: {src,url,st,err}
-            jq -r '
-              (.fail_map // {}) as $m
-              | [ $m | to_entries[] | . as $e
-                  | $e.value[] | {
-                      src: (.source.file // .source // "unknown"),
-                      url: $e.key,
-                      st:  (.status // .code // .response?.status // .checks?[0]?.status // "ERR"),
-                      err: (.error // .reason // .message // "")
-                    }
-                ] as $rows
-              | if ($rows|length)==0 then
-                  "No broken links."
-                else
-                  ( $rows
-                    | group_by(.src)[]
-                    | "Errors in " + (.[0].src) + ":\n"
-                      + ( map("[" + (.st|tostring) + "] " + .url + (if .err=="" then "" else " | " + .err end))
-                          | unique | join("\n"))
-                      + "\n"
-                  )
-                end
-            ' "$OUT" > report.txt
+            exit 0
           fi
 
-          echo "---- preview ----"
+          # сколько всего “битых” (сумма длин массивов в fail_map)
+          ERR=$(jq '(.fail_map // {}) | to_entries | map(.value | length) | add // 0' "$OUT")
+          echo "broken=$ERR" >> $GITHUB_OUTPUT
+
+          # Группируем по исходному файлу и печатаем ровно как в UI:
+          # Errors in <file>:
+          # [STATUS] URL | reason
+          jq -r '
+            (.fail_map // {}) as $m
+            | [ $m | to_entries[] | . as $e
+                | $e.value[] | {
+                    src: (.source.file // .source // "unknown"),
+                    url: $e.key,
+                    st:  (.status // .code // .response?.status // .checks?[0]?.status // "ERR"),
+                    err: (.error // .reason // .message // "")
+                  }
+              ] as $rows
+            | if ($rows|length)==0 then
+                "No broken links."
+              else
+                ( $rows
+                  | group_by(.src)[]
+                  | "Errors in " + (.[0].src) + ":\n"
+                    + ( map("[" + (.st|tostring) + "] " + .url + (if .err=="" then "" else " | " + .err end))
+                        | unique | join("\n"))
+                    + "\n"
+                )
+              end
+          ' "$OUT" > report.txt
+
+          echo "---- REPORT PREVIEW ----"
           sed -n '1,120p' report.txt || true
 
-      # ---------- 4) GitHub Summary (как в UI: список ошибок per file) ----------
-      - name: Publish GitHub job summary
+      # ---------- 4) Пишем ТОЛЬКО этот отчёт в GitHub Summary ----------
+      - name: Publish Job Summary (broken only)
         shell: bash
         run: |
-          echo "### Link Check — Broken Links Only" >> $GITHUB_STEP_SUMMARY
+          # подчистим Summary на случай мусора от прошлых шагов
+          : > $GITHUB_STEP_SUMMARY
+          echo "### Broken Links (lychee)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`Upstream synced:\` **${{ steps.sync.outputs.synced || 'false' }}**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -146,7 +159,7 @@ jobs:
             lychee.json
             report.txt
 
-      # ---------- 5) Telegram: текст + полный отчёт файлом ----------
+      # ---------- 5) Telegram: текст + полный файл ----------
       - name: Send Telegram
         if: always()
         env:
@@ -159,21 +172,21 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           {
-            echo "Link Check — Broken Links Only"
+            echo "Broken Links Report"
             echo "Broken: ${BROKEN:-0}"
             echo "Upstream synced: ${SYNCED:-false}"
             echo "Run: ${RUN_URL}"
             echo
           } > message.txt
 
-          # первые ~3000 символов текста для sendMessage (лимит телеги ~4096)
           head -c 3000 report.txt >> message.txt
 
+          # отправляем как "сырой" текст с реальными переносами строк
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -H 'content-type: application/json' \
             -d "$(jq -Rs --arg chat "${ADMIN_ID}" '{chat_id:$chat, text:. , disable_web_page_preview:true}' < message.txt)"
 
-          # полный отчёт файлом
+          # прикрепим ПОЛНЫЙ отчёт файлом
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
             -F "chat_id=${ADMIN_ID}" \
             -F "document=@report.txt" \
