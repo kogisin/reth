@@ -2,15 +2,14 @@ name: Daily Sync -> Link Check -> TG (admin only)
 
 on:
   schedule:
-    - cron: "7 7 * * *"        # ежедневно 07:07 UTC
-  workflow_dispatch: {}         # ручной запуск
+    - cron: "7 7 * * *"            # ежедневно 07:07 UTC
+  workflow_dispatch: {}             # ручной запуск
 
 permissions:
-  contents: write               # пуш в форк
+  contents: write                   # пуш в форк
 
 env:
-  # Укажи реальный апстрим, если другой:
-  UPSTREAM: paradigmxyz/reth
+  UPSTREAM: paradigmxyz/reth        # <— поправь на реальный апстрим
   BRANCH: main
 
 jobs:
@@ -18,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ===== 1) СИНХРОНИЗАЦИЯ ФОРКА (FAST-FORWARD, без переписывания истории) =====
+      # ===== 1) Синхронизация форка (fast-forward, без переписывания истории) =====
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
@@ -42,8 +41,6 @@ jobs:
         run: |
           set -e
           git checkout "${BRANCH}"
-
-          # Можно ли fast-forward до upstream/BRANCH?
           if git merge-base --is-ancestor HEAD "upstream/${BRANCH}"; then
             BEFORE=$(git rev-parse HEAD)
             git merge --ff-only "upstream/${BRANCH}"
@@ -59,7 +56,7 @@ jobs:
             echo "Fast-forward not possible (fork ahead). Skipping auto-sync."
           fi
 
-      # ===== 2) ПРОВЕРКА ССЫЛОК (LYCHEE) =====
+      # ===== 2) Проверка ссылок (lychee) =====
       - name: Re-checkout repo (post-sync)
         uses: actions/checkout@v4
         with:
@@ -69,12 +66,11 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Run Lychee link checker
+      - name: Run lychee (JSON report)
         id: lychee
-        continue-on-error: true          # не валим job; разберёмся в следующем шаге
+        continue-on-error: true               # не валим job — сами обработаем
         uses: lycheeverse/lychee-action@v2.2.0
         with:
-          # Важно: не указываем --output в args. Используем input "output".
           args: >-
             --no-progress
             --accept 200,429
@@ -84,52 +80,52 @@ jobs:
             --verbose
             --format json
             "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
-          output: lychee.json
+          output: lychee.json                 # ВАЖНО: выходной файл через input, НЕ в args
 
       - name: Build TG-style report (group by source file)
         id: extract
         shell: bash
         run: |
           OUT="lychee.json"
-          if [ ! -s "$OUT" ]; then
-            echo "Lychee did not produce report (outcome=${{ steps.lychee.outcome }})"
-            : > tg_report.txt
+          : > tg_report.txt
+          : > bad_links.txt
+
+          if [ -s "$OUT" ]; then
+            # уникальные битые URL
+            jq -r '(.fail_map // {}) | to_entries[] | .key' "$OUT" | sort -u > bad_links.txt || true
+            COUNT=$(wc -l < bad_links.txt | tr -d ' ')
+            echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+            # «как в UI»: Errors in <file>:\n[status] URL | reason
+            jq -r '
+              (.fail_map // {}) as $m
+              | reduce ($m|to_entries[]) as $e ([];
+                  . + ( $e.value
+                        | map({
+                            src: (.source.file // .source // "unknown"),
+                            st:  (.status // .code // .response?.status // .checks?[0]?.status // "ERR"),
+                            err: (.error // .reason // .message // ""),
+                            url: $e.key
+                          })
+                      )
+                )
+              | group_by(.src)[]
+              | "Errors in " + (.[0].src) + ":\n"
+                + (map("[" + ( .st|tostring ) + "] " + .url + (if .err=="" then "" else " | " + .err end))
+                   | unique | join("\n"))
+                + "\n"
+            ' "$OUT" > tg_report.txt || true
+          else
             echo "count=0" >> $GITHUB_OUTPUT
-            exit 0
           fi
 
-          # Уникальные битые URL
-          jq -r '(.fail_map // {}) | to_entries[] | .key' "$OUT" | sort -u > bad_links.txt || true
-          COUNT=$(wc -l < bad_links.txt | tr -d ' ')
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
-
-          # Сводка «как в UI»: Errors in <file>:\n[status] URL | reason
-          jq -r '
-            (.fail_map // {}) as $m
-            | reduce ($m|to_entries[]) as $e ([];
-                . + ( $e.value
-                      | map({
-                          src: (.source.file // .source // "unknown"),
-                          st:  (.status // .code // .response?.status // .checks?[0]?.status // "ERR"),
-                          err: (.error // .reason // .message // ""),
-                          url: $e.key
-                        })
-                    )
-              )
-            | group_by(.src)[]
-            | "Errors in " + (.[0].src) + ":\n"
-              + (map("[" + ( .st|tostring ) + "] " + .url + (if .err=="" then "" else " | " + .err end))
-                 | unique | join("\n"))
-              + "\n"
-          ' "$OUT" > tg_report.txt || true
-
-          # Ограничим размер сообщения для Telegram (~4096 символов)
-          head -c 3500 tg_report.txt > tg_report.txt.trim && mv tg_report.txt.trim tg_report.txt
+          # ограничим длину текста для sendMessage
+          head -c 3500 tg_report.txt > tg_report.trim && mv tg_report.trim tg_report.txt
 
           echo "---- preview ----"
           sed -n '1,80p' tg_report.txt || true
 
-      - name: Upload artifacts (optional)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -139,12 +135,12 @@ jobs:
             bad_links.txt
             tg_report.txt
 
-      # ===== 3) ОТПРАВКА ОТЧЁТА В ТЕЛЕГРАМ (ТОЛЬКО АДМИНУ) =====
-      - name: Send Telegram report to admin only
+      # ===== 3) Отправка отчёта в Telegram (только админу, с корректными переносами строк) =====
+      - name: Send Telegram (admin only)
         if: always()
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}   # твой личный chat_id
+          ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
           COUNT:   ${{ steps.extract.outputs.count }}
           SYNCED:  ${{ steps.sync.outputs.synced }}
         shell: bash
@@ -152,18 +148,42 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           OUTCOME="${{ steps.lychee.outcome }}"   # success | failure | cancelled
 
-          if [ -s tg_report.txt ]; then
-            HEADER="🟥 Link check: ${OUTCOME}\nBroken: ${COUNT}\nUpstream synced: ${SYNCED:-false}\nRun: ${RUN_URL}\n\n"
-            TEXT="$HEADER$(cat tg_report.txt)"
+          if [ -s tg_report.txt ] && [ "${COUNT:-0}" -gt 0 ]; then
+            {
+              echo "🟥 Link check: ${OUTCOME}"
+              echo "Broken: ${COUNT}"
+              echo "Upstream synced: ${SYNCED:-false}"
+              echo "Run: ${RUN_URL}"
+              echo
+              cat tg_report.txt
+            } > message.txt
           else
-            if [ "$OUTCOME" = "success" ]; then
-              TEXT="✅ Link check: success\nAll links OK\nUpstream synced: ${SYNCED:-false}\nRun: ${RUN_URL}"
+            if [ "${OUTCOME}" = "success" ]; then
+              {
+                echo "✅ Link check: success"
+                echo "All links OK"
+                echo "Upstream synced: ${SYNCED:-false}"
+                echo "Run: ${RUN_URL}"
+              } > message.txt
             else
-              TEXT="🟧 Link check: ${OUTCOME}\n(no report generated)\nUpstream synced: ${SYNCED:-false}\nRun: ${RUN_URL}"
+              {
+                echo "🟧 Link check: ${OUTCOME}"
+                echo "(no report generated)"
+                echo "Upstream synced: ${SYNCED:-false}"
+                echo "Run: ${RUN_URL}"
+              } > message.txt
             fi
           fi
 
+          # корректные переносы: читаем файл и сериализуем как «raw string»
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -H 'content-type: application/json' \
-            -d "$(jq -n --arg chat "${ADMIN_ID}" --arg txt "${TEXT}" \
-                  '{chat_id:$chat, text:$txt, disable_web_page_preview:true }')"
+            -d "$(jq -Rs --arg chat "${ADMIN_ID}" '{chat_id:$chat, text:. , disable_web_page_preview:true}' < message.txt)"
+
+          # если отчёт длинный — приложим полный текст файлом
+          if [ -s tg_report.txt ]; then
+            curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
+              -F "chat_id=${ADMIN_ID}" \
+              -F "document=@tg_report.txt" \
+              -F "caption=Full link check report"
+          fi
