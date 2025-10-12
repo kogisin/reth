@@ -106,8 +106,11 @@ jobs:
           lychee \
             --max-concurrency 8 \
             --no-progress \
+            --no-cache \
+            --no-git-ignore \
+            --max-concurrency 16 \
             --timeout 25 \
-            --retry-wait-time 2 \
+            --retry-wait-time 3 \
             --max-retries 2 \
             --header "User-agent: GitHubAction-lychee" \
             --accept 200,429 \
