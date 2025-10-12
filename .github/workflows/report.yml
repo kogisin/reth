@@ -2,13 +2,14 @@ name: report.yml
 
 on:
   schedule:
-    - cron: "7 7 * * *"
+    - cron: "7 7 * * *"            # ежедневно 07:07 UTC
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
 env:
+  # Поменяй при необходимости
   UPSTREAM: paradigmxyz/reth
   BRANCH: main
 
@@ -17,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ---------- 1) SYNC: FF если можно, иначе merge-commit ----------
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
@@ -30,51 +32,112 @@ jobs:
 
       - name: Add upstream & fetch
         run: |
+          set -e
           git remote add upstream "https://github.com/${{ env.UPSTREAM }}.git" || true
-          git fetch upstream --prune
-          git fetch origin  --prune
+          git fetch --prune upstream
+          git fetch --prune origin
 
-      - name: Fast-forward from upstream
+      - name: Sync from upstream (FF or merge-commit)
         id: sync
         shell: bash
         run: |
           set -e
           git checkout "${BRANCH}"
+          MODE="none"
           if git merge-base --is-ancestor HEAD "upstream/${BRANCH}"; then
             BEFORE=$(git rev-parse HEAD)
             git merge --ff-only "upstream/${BRANCH}"
             AFTER=$(git rev-parse HEAD)
             if [ "$BEFORE" != "$AFTER" ]; then
+              MODE="fast-forward"
               git push origin "HEAD:${BRANCH}"
-              echo "synced=true" >> $GITHUB_OUTPUT
-            else
-              echo "synced=false" >> $GITHUB_OUTPUT
             fi
           else
-            echo "synced=false" >> $GITHUB_OUTPUT
-            echo "Fast-forward not possible; skipping auto-sync."
+            # Форк ушёл вперёд — делаем merge-commit, пытаясь избежать конфликтов
+            set +e
+            git merge --no-edit "upstream/${BRANCH}"
+            MERGESTAT=$?
+            set -e
+            if [ $MERGESTAT -eq 0 ]; then
+              MODE="merge-commit"
+              git push origin "HEAD:${BRANCH}"
+            else
+              MODE="conflict-skip"
+              git merge --abort || true
+            fi
           fi
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
 
-      - name: Install tools (jq + lychee)
+      # ---------- 2) LYCHEE: сначала Docker, при сбое — fallback на бинарник ----------
+      - name: Prepare workspace paths
+        id: paths
+        run: |
+          echo "ws=$GITHUB_WORKSPACE" >> $GITHUB_OUTPUT
+          echo "json=$GITHUB_WORKSPACE/lychee.json" >> $GITHUB_OUTPUT
+          echo "report=$GITHUB_WORKSPACE/report.txt" >> $GITHUB_OUTPUT
+
+      - name: Try lychee via Docker
+        id: lychee_docker
+        continue-on-error: true
         shell: bash
         run: |
           set -e
-          sudo apt-get update
-          sudo apt-get install -y jq curl
-          VER=$(curl -s https://api.github.com/repos/lycheeverse/lychee/releases/latest | jq -r .tag_name)
-          curl -L "https://github.com/lycheeverse/lychee/releases/download/${VER}/lychee-${VER}-x86_64-unknown-linux-gnu.tar.gz" -o lychee.tgz
+          JSON="${{ steps.paths.outputs.json }}"
+          # На ubuntu-latest Docker есть; если выключен — этот шаг завершится fail, пойдём на fallback
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            ghcr.io/lycheeverse/lychee:latest \
+              --max-concurrency 8 \
+              --no-progress \
+              --timeout 20 \
+              --retry-wait-time 2 \
+              --max-retries 2 \
+              --header "user-agent:Mozilla/5.0 GitHubAction lychee" \
+              --accept 200,429 \
+              --exclude "http://localhost(:[0-9]+)?/" \
+              --exclude "enode://*" \
+              --exclude "http://127.0.0.1(:[0-9]+)?/" \
+              --verbose \
+              --format json \
+              "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts" \
+              > "$JSON"
+          test -s "$JSON" && echo "ok=true" >> $GITHUB_OUTPUT || echo "ok=false" >> $GITHUB_OUTPUT
+
+      - name: Fallback: install lychee binary and run
+        if: steps.lychee_docker.outputs.ok != 'true'
+        id: lychee_bin
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -e
+          JSON="${{ steps.paths.outputs.json }}"
+          # Ставим jq/curl (jq уже обычно стоит), подстраховка
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl file
+          # Берём правильный архив под linux-gnu
+          REL=$(curl -s https://api.github.com/repos/lycheeverse/lychee/releases/latest | jq -r .tag_name)
+          ASSET=$(curl -s https://api.github.com/repos/lycheeverse/lychee/releases/latest | \
+                   jq -r '.assets[] | select(.name|test("x86_64-unknown-linux-gnu.*\\.tar\\.gz$")) | .browser_download_url' | head -n1)
+          if [ -z "$ASSET" ]; then
+            echo "Lychee asset not found"; exit 1
+          fi
+          echo "Downloading: $ASSET"
+          curl -L "$ASSET" -o lychee.tgz
+          file lychee.tgz | grep -qi gzip || { echo "Archive is not gzip"; exit 1; }
           tar -xzf lychee.tgz
+          chmod +x lychee
           sudo mv lychee /usr/local/bin/lychee
           lychee --version
 
-      - name: Run lychee -> lychee.json
-        id: run_lychee
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -o pipefail
+          set +e
           lychee \
+            --max-concurrency 8 \
             --no-progress \
+            --timeout 20 \
+            --retry-wait-time 2 \
+            --max-retries 2 \
+            --header "user-agent:Mozilla/5.0 GitHubAction lychee" \
             --accept 200,429 \
             --exclude "http://localhost(:[0-9]+)?/" \
             --exclude "enode://*" \
@@ -82,26 +145,30 @@ jobs:
             --verbose \
             --format json \
             "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts" \
-            > "$GITHUB_WORKSPACE/lychee.json"
-          jq 'keys' "$GITHUB_WORKSPACE/lychee.json" || true
+            > "$JSON"
+          set -e
+          test -s "$JSON" && echo "ok=true" >> $GITHUB_OUTPUT || echo "ok=false" >> $GITHUB_OUTPUT
 
-      - name: Build report (only broken links, grouped by file)
+      # ---------- 3) Строим отчёт ТОЛЬКО из fail_map ----------
+      - name: Build broken-links report
         id: build
         shell: bash
         run: |
-          OUT="$GITHUB_WORKSPACE/lychee.json"
-          REPORT="$GITHUB_WORKSPACE/report.txt"
+          JSON="${{ steps.paths.outputs.json }}"
+          REPORT="${{ steps.paths.outputs.report }}"
           : > "$REPORT"
 
-          if [ ! -s "$OUT" ]; then
-            echo "Lychee JSON is missing (outcome=${{ steps.run_lychee.outcome }})" > "$REPORT"
+          if [ ! -s "$JSON" ]; then
+            echo "Lychee JSON is missing (docker_ok=${{ steps.lychee_docker.outputs.ok }}, bin_ok=${{ steps.lychee_bin.outputs.ok }})" > "$REPORT"
             echo "broken=0" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          ERR=$(jq '(.fail_map // {}) | to_entries | map(.value | length) | add // 0' "$OUT")
+          # Сумма длин массивов в fail_map
+          ERR=$(jq '(.fail_map // {}) | to_entries | map(.value | length) | add // 0' "$JSON")
           echo "broken=$ERR" >> $GITHUB_OUTPUT
 
+          # Группировка «как в UI»
           jq -r '
             (.fail_map // {}) as $m
             | [ $m | to_entries[] | . as $e
@@ -123,19 +190,19 @@ jobs:
                     + "\n"
                 )
               end
-          ' "$OUT" > "$REPORT"
+          ' "$JSON" > "$REPORT"
 
-          echo "---- REPORT PREVIEW ----"
+          echo "--- preview ---"
           sed -n '1,120p' "$REPORT" || true
 
-      - name: Publish Job Summary (broken only)
+      # ---------- 4) GitHub Summary ----------
+      - name: Publish GitHub Summary
         shell: bash
         run: |
-          REPORT="$GITHUB_WORKSPACE/report.txt"
-          : > $GITHUB_STEP_SUMMARY
-          echo "### Broken Links (lychee)" >> $GITHUB_STEP_SUMMARY
+          REPORT="${{ steps.paths.outputs.report }}"
+          echo "### Broken Links (lychee)" > $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`Upstream synced:\` **${{ steps.sync.outputs.synced || 'false' }}**" >> $GITHUB_STEP_SUMMARY
+          echo "\`Sync mode:\` **${{ steps.sync.outputs.mode }}**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```text' >> $GITHUB_STEP_SUMMARY
           cat "$REPORT" >> $GITHUB_STEP_SUMMARY
@@ -146,45 +213,42 @@ jobs:
         with:
           name: lychee-report
           path: |
-            ${{ github.workspace }}/lychee.json
-            ${{ github.workspace }}/report.txt
+            ${{ steps.paths.outputs.json }}
+            ${{ steps.paths.outputs.report }}
 
-      # -------------- FIXED STEP ---------------
+      # ---------- 5) Telegram: текст + полный файл ----------
       - name: Send Telegram
         if: always()
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
           BROKEN:   ${{ steps.build.outputs.broken }}
-          SYNCED:   ${{ steps.sync.outputs.synced }}
+          MODE:     ${{ steps.sync.outputs.mode }}
         shell: bash
         run: |
           set +e
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          REPORT="$GITHUB_WORKSPACE/report.txt"
+          REPORT="${{ steps.paths.outputs.report }}"
 
-          echo "Workspace: $GITHUB_WORKSPACE"
-          echo "Files:"
-          ls -la "$GITHUB_WORKSPACE" || true
-
-          : > "$GITHUB_WORKSPACE/message.txt"
+          MSG="$GITHUB_WORKSPACE/message.txt"
+          : > "$MSG"
           {
             echo "Broken Links Report"
             echo "Broken: ${BROKEN:-0}"
-            echo "Upstream synced: ${SYNCED:-false}"
+            echo "Sync mode: ${MODE:-none}"
             echo "Run: ${RUN_URL}"
             echo
-          } >> "$GITHUB_WORKSPACE/message.txt"
+          } >> "$MSG"
 
           if [ -f "$REPORT" ]; then
-            head -c 3000 "$REPORT" >> "$GITHUB_WORKSPACE/message.txt"
+            head -c 3500 "$REPORT" >> "$MSG"
           else
-            echo "(no report generated)" >> "$GITHUB_WORKSPACE/message.txt"
+            echo "(no report generated)" >> "$MSG"
           fi
 
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -H 'content-type: application/json' \
-            -d "$(jq -Rs --arg chat "${ADMIN_ID}" '{chat_id:$chat, text:. , disable_web_page_preview:true}' < "$GITHUB_WORKSPACE/message.txt")"
+            -d "$(jq -Rs --arg chat "${ADMIN_ID}" '{chat_id:$chat, text:. , disable_web_page_preview:true}' < "$MSG")"
 
           if [ -f "$REPORT" ]; then
             curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
