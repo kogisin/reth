@@ -2,14 +2,14 @@ name: report.yml
 
 on:
   schedule:
-    - cron: "7 7 * * *"    # ежедневно 07:07 UTC
+    - cron: "7 7 * * *"      # ежедневно 07:07 UTC
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
 env:
-  UPSTREAM: paradigmxyz/reth    # поменяй при необходимости
+  UPSTREAM: paradigmxyz/reth    # при необходимости поменяй
   BRANCH: main
 
 jobs:
@@ -64,15 +64,16 @@ jobs:
               git merge --abort || true
             fi
           fi
+
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 
       - name: Prepare paths
         id: paths
         run: |
-          echo "json=$GITHUB_WORKSPACE/lychee.json" >> "$GITHUB_OUTPUT"
+          echo "json=$GITHUB_WORKSPACE/lychee.json"  >> "$GITHUB_OUTPUT"
           echo "report=$GITHUB_WORKSPACE/report.txt" >> "$GITHUB_OUTPUT"
 
-      # ---------- 2) Lychee с JSON (build из source) ----------
+      # ---------- 2) Установка lychee с поддержкой JSON ----------
       - name: Install lychee (from source with JSON support)
         id: lychee_build
         continue-on-error: true
@@ -98,7 +99,7 @@ jobs:
           sudo mv lychee /usr/local/bin/lychee
           lychee --version || true
 
-      # ---------- 3) Запуск проверки с жёсткими фильтрами ----------
+      # ---------- 3) Запуск проверки (жёсткие фильтры) ----------
       - name: Run lychee link checker
         id: lychee
         shell: bash
@@ -109,7 +110,7 @@ jobs:
 
           lychee \
             --no-progress \
-            --no-git-ignore \
+            --no-ignore \
             --include-fragments \
             --cache "$CACHE" \
             --max-concurrency 16 \
@@ -117,10 +118,11 @@ jobs:
             --retry-wait-time 3 \
             --max-retries 3 \
             --header "User-Agent: GitHubAction-lychee" \
-            --accept 200,429 \
+            --accept 200,206,301,302,429 \
             --exclude "http://localhost(:[0-9]+)?/" \
-            --exclude "enode://*" \
+            --exclude "https://localhost(:[0-9]+)?/" \
             --exclude "http://127.0.0.1(:[0-9]+)?/" \
+            --exclude "enode://*" \
             --verbose \
             --format json \
             --output "$JSON" \
@@ -137,7 +139,7 @@ jobs:
           fi
           set -e
 
-      # ---------- 4) Строим человекочитаемый отчёт (только fail_map) ----------
+      # ---------- 4) Человекочитаемый отчёт (только fail_map) ----------
       - name: Build report
         id: build
         shell: bash
