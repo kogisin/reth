@@ -1,15 +1,15 @@
-name: Daily Sync -> Link Check -> TG (admin only)
+name: report.yml
 
 on:
   schedule:
-    - cron: "7 7 * * *"            # ежедневно 07:07 UTC
-  workflow_dispatch: {}             # ручной запуск
+    - cron: "7 7 * * *"           # ежедневно 07:07 UTC
+  workflow_dispatch: {}
 
 permissions:
-  contents: write                   # пуш в форк
+  contents: write                 # пуш в форк
 
 env:
-  UPSTREAM: paradigmxyz/reth        # <— поправь на реальный апстрим
+  UPSTREAM: paradigmxyz/reth      # ← замени на фактический апстрим, если другой
   BRANCH: main
 
 jobs:
@@ -17,14 +17,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ===== 1) Синхронизация форка (fast-forward, без переписывания истории) =====
+      # ---------- 1) SYNC (fast-forward only) ----------
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ env.BRANCH }}
 
-      - name: Configure git bot identity
+      - name: Configure git identity
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -35,7 +35,7 @@ jobs:
           git fetch upstream --prune
           git fetch origin  --prune
 
-      - name: Fast-forward merge from upstream (no history rewrite)
+      - name: Fast-forward from upstream
         id: sync
         shell: bash
         run: |
@@ -53,10 +53,10 @@ jobs:
             fi
           else
             echo "synced=false" >> $GITHUB_OUTPUT
-            echo "Fast-forward not possible (fork ahead). Skipping auto-sync."
+            echo "Fast-forward not possible; skipping auto-sync."
           fi
 
-      # ===== 2) Проверка ссылок (lychee) =====
+      # ---------- 2) LYCHEE ----------
       - name: Re-checkout repo (post-sync)
         uses: actions/checkout@v4
         with:
@@ -66,9 +66,9 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Run lychee (JSON report)
+      - name: Run lychee (JSON)
         id: lychee
-        continue-on-error: true               # не валим job — сами обработаем
+        continue-on-error: true
         uses: lycheeverse/lychee-action@v2.2.0
         with:
           args: >-
@@ -80,23 +80,46 @@ jobs:
             --verbose
             --format json
             "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
-          output: lychee.json                 # ВАЖНО: выходной файл через input, НЕ в args
+          output: lychee.json
 
-      - name: Build TG-style report (group by source file)
-        id: extract
+      # ---------- 3) Сборка отчёта как в UI ----------
+      - name: Build “UI-like” report (summary + errors per input)
+        id: build
         shell: bash
         run: |
           OUT="lychee.json"
-          : > tg_report.txt
-          : > bad_links.txt
+          : > report.txt
+          : > summary.json
 
-          if [ -s "$OUT" ]; then
-            # уникальные битые URL
-            jq -r '(.fail_map // {}) | to_entries[] | .key' "$OUT" | sort -u > bad_links.txt || true
-            COUNT=$(wc -l < bad_links.txt | tr -d ' ')
-            echo "count=$COUNT" >> $GITHUB_OUTPUT
+          # Если отчёт не создан — завершаем минимумом, чтобы TG и Summary не вели себя как “ОК”
+          if [ ! -s "$OUT" ]; then
+            echo '{ "total": 0, "successful": 0, "errors": 0, "excludes": 0, "cached": 0, "unknown": 0, "unsupported": 0, "redirects": 0, "timeouts": 0 }' > summary.json
+            echo "Lychee did not produce report (outcome=${{ steps.lychee.outcome }})" > report.txt
+            echo "broken=0" >> $GITHUB_OUTPUT
+          else
+            # попытка достать счетчики из разных возможных полей (lychee менял схему в версиях)
+            TOTAL=$(jq '(.stats.total // .total // 0)' "$OUT")
+            OK=$(jq '(.stats.success // .successful // (.ok // 0))' "$OUT")
+            ERR=$(jq '((.stats.errors // .errors), (.fail_map | length // 0)) | select(.!=null) | . ' "$OUT")
+            EXCL=$(jq '(.stats.excludes // .excludes // (.exclude_map | length // 0) // 0)' "$OUT")
+            CACHED=$(jq '(.stats.cached // .cached // 0)' "$OUT")
+            UNK=$(jq '(.stats.unknown // .unknown // 0)' "$OUT")
+            UNSUP=$(jq '(.stats.unsupported // .unsupported // 0)' "$OUT")
+            REDIR=$(jq '(.stats.redirects // .redirects // 0)' "$OUT")
+            TIMEO=$(jq '(.stats.timeouts // .timeouts // 0)' "$OUT")
 
-            # «как в UI»: Errors in <file>:\n[status] URL | reason
+            # если ERR пустой — ставим 0
+            if [ -z "$ERR" ]; then ERR=0; fi
+
+            jq -n --argjson total "$TOTAL" --argjson ok "$OK" --argjson err "$ERR" \
+                  --argjson exc "$EXCL" --argjson cached "$CACHED" --argjson unk "$UNK" \
+                  --argjson uns "$UNSUP" --argjson red "$REDIR" --argjson tmo "$TIMEO" \
+              '{ total:$total, successful:$ok, errors:$err, excludes:$exc, cached:$cached, unknown:$unk, unsupported:$uns, redirects:$red, timeouts:$tmo }' \
+              > summary.json
+
+            echo "broken=$ERR" >> $GITHUB_OUTPUT
+
+            # Ошибки по файлам: Errors in <file>:\n[status] URL | reason
             jq -r '
               (.fail_map // {}) as $m
               | reduce ($m|to_entries[]) as $e ([];
@@ -109,81 +132,83 @@ jobs:
                           })
                       )
                 )
-              | group_by(.src)[]
-              | "Errors in " + (.[0].src) + ":\n"
-                + (map("[" + ( .st|tostring ) + "] " + .url + (if .err=="" then "" else " | " + .err end))
-                   | unique | join("\n"))
-                + "\n"
-            ' "$OUT" > tg_report.txt || true
-          else
-            echo "count=0" >> $GITHUB_OUTPUT
+              | if length==0 then "No broken links." else
+                  (
+                    "Summary\n" +
+                    ( "  total:        " + ((input | .total)|tostring) + "\n" ) +
+                    ( "  successful:   " + ((input | .successful)|tostring) + "\n" ) +
+                    ( "  errors:       " + ((input | .errors)|tostring) + "\n" ) +
+                    ( "  excludes:     " + ((input | .excludes)|tostring) + "\n" ) +
+                    ( "  cached:       " + ((input | .cached)|tostring) + "\n" ) +
+                    ( "  unknown:      " + ((input | .unknown)|tostring) + "\n" ) +
+                    ( "  unsupported:  " + ((input | .unsupported)|tostring) + "\n" ) +
+                    ( "  redirects:    " + ((input | .redirects)|tostring) + "\n" ) +
+                    ( "  timeouts:     " + ((input | .timeouts)|tostring) + "\n\n" )
+                  ) as $hdr
+                  | group_by(.src)[]
+                  | "Errors in " + (.[0].src) + ":\n"
+                    + (map("[" + ( .st|tostring ) + "] " + .url + (if .err=="" then "" else " | " + .err end))
+                       | unique | join("\n"))
+                    + "\n"
+                  , $hdr
+              ' --slurpfile summary summary.json "$OUT" \
+              | awk 'BEGIN{hdr=""} { if($0 ~ /^Summary$/){hdr=$0; getline; s=$0; for(i=1;i<9;i++){getline; s=s"\n"$0} print hdr"\n"s; next } print }' \
+              > report.txt
           fi
 
-          # ограничим длину текста для sendMessage
-          head -c 3500 tg_report.txt > tg_report.trim && mv tg_report.trim tg_report.txt
+          echo "---- preview (first 120 lines) ----"
+          sed -n '1,120p' report.txt || true
 
-          echo "---- preview ----"
-          sed -n '1,80p' tg_report.txt || true
+      # ---------- 4) Публикация отчёта в GitHub Summary ----------
+      - name: Publish GitHub job summary (Markdown)
+        shell: bash
+        run: |
+          echo "### Link Check Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`Upstream synced:\` **${{ steps.sync.outputs.synced || 'false' }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          cat report.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload artifacts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: lychee-report
           path: |
             lychee.json
-            bad_links.txt
-            tg_report.txt
+            summary.json
+            report.txt
 
-      # ===== 3) Отправка отчёта в Telegram (только админу, с корректными переносами строк) =====
-      - name: Send Telegram (admin only)
+      # ---------- 5) Telegram (тот же отчёт: коротко в сообщении + полный файлом) ----------
+      - name: Send Telegram
         if: always()
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
-          COUNT:   ${{ steps.extract.outputs.count }}
-          SYNCED:  ${{ steps.sync.outputs.synced }}
+          SYNCED:   ${{ steps.sync.outputs.synced }}
         shell: bash
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          OUTCOME="${{ steps.lychee.outcome }}"   # success | failure | cancelled
 
-          if [ -s tg_report.txt ] && [ "${COUNT:-0}" -gt 0 ]; then
-            {
-              echo "🟥 Link check: ${OUTCOME}"
-              echo "Broken: ${COUNT}"
-              echo "Upstream synced: ${SYNCED:-false}"
-              echo "Run: ${RUN_URL}"
-              echo
-              cat tg_report.txt
-            } > message.txt
-          else
-            if [ "${OUTCOME}" = "success" ]; then
-              {
-                echo "✅ Link check: success"
-                echo "All links OK"
-                echo "Upstream synced: ${SYNCED:-false}"
-                echo "Run: ${RUN_URL}"
-              } > message.txt
-            else
-              {
-                echo "🟧 Link check: ${OUTCOME}"
-                echo "(no report generated)"
-                echo "Upstream synced: ${SYNCED:-false}"
-                echo "Run: ${RUN_URL}"
-              } > message.txt
-            fi
-          fi
+          # заголовок
+          {
+            echo "Link Check Report"
+            echo "Upstream synced: ${SYNCED:-false}"
+            echo "Run: ${RUN_URL}"
+            echo
+          } > message.txt
 
-          # корректные переносы: читаем файл и сериализуем как «raw string»
+          # добавим первые ~3000 символов отчёта (чтобы точно влезло в 4096)
+          head -c 3000 report.txt >> message.txt
+
+          # Отправляем текст как raw-string (с реальными переносами)
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -H 'content-type: application/json' \
             -d "$(jq -Rs --arg chat "${ADMIN_ID}" '{chat_id:$chat, text:. , disable_web_page_preview:true}' < message.txt)"
 
-          # если отчёт длинный — приложим полный текст файлом
-          if [ -s tg_report.txt ]; then
-            curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
-              -F "chat_id=${ADMIN_ID}" \
-              -F "document=@tg_report.txt" \
-              -F "caption=Full link check report"
-          fi
+          # Прикрепим ПОЛНЫЙ отчёт файлом
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
+            -F "chat_id=${ADMIN_ID}" \
+            -F "document=@report.txt" \
+            -F "caption=Full link check report"
