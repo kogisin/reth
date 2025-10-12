@@ -2,14 +2,14 @@ name: report.yml
 
 on:
   schedule:
-    - cron: "7 7 * * *"      # ежедневно 07:07 UTC
+    - cron: "7 7 * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
 env:
-  UPSTREAM: paradigmxyz/reth   # поменяй при необходимости
+  UPSTREAM: paradigmxyz/reth
   BRANCH: main
 
 jobs:
@@ -17,7 +17,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ---------- 1) SYNC (fast-forward only) ----------
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
@@ -56,14 +55,12 @@ jobs:
             echo "Fast-forward not possible; skipping auto-sync."
           fi
 
-      # ---------- 2) LYCHEE CLI (без action, полный контроль) ----------
       - name: Install tools (jq + lychee)
         shell: bash
         run: |
           set -e
           sudo apt-get update
           sudo apt-get install -y jq curl
-          # ставим последнюю стабильную (под x86_64 linux)
           VER=$(curl -s https://api.github.com/repos/lycheeverse/lychee/releases/latest | jq -r .tag_name)
           curl -L "https://github.com/lycheeverse/lychee/releases/download/${VER}/lychee-${VER}-x86_64-unknown-linux-gnu.tar.gz" -o lychee.tgz
           tar -xzf lychee.tgz
@@ -76,7 +73,6 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          # ВАЖНО: полностью управляем входами/выходом
           lychee \
             --no-progress \
             --accept 200,429 \
@@ -86,31 +82,26 @@ jobs:
             --verbose \
             --format json \
             "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts" \
-            > lychee.json
-          # покажем ключи верхнего уровня для дебага
-          jq 'keys' lychee.json || true
+            > "$GITHUB_WORKSPACE/lychee.json"
+          jq 'keys' "$GITHUB_WORKSPACE/lychee.json" || true
 
-      # ---------- 3) Формируем ОТЧЁТ ТОЛЬКО из fail_map ----------
       - name: Build report (only broken links, grouped by file)
         id: build
         shell: bash
         run: |
-          OUT="lychee.json"
-          : > report.txt
+          OUT="$GITHUB_WORKSPACE/lychee.json"
+          REPORT="$GITHUB_WORKSPACE/report.txt"
+          : > "$REPORT"
 
           if [ ! -s "$OUT" ]; then
-            echo "Lychee JSON is missing (outcome=${{ steps.run_lychee.outcome }})" > report.txt
+            echo "Lychee JSON is missing (outcome=${{ steps.run_lychee.outcome }})" > "$REPORT"
             echo "broken=0" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # сколько всего “битых” (сумма длин массивов в fail_map)
           ERR=$(jq '(.fail_map // {}) | to_entries | map(.value | length) | add // 0' "$OUT")
           echo "broken=$ERR" >> $GITHUB_OUTPUT
 
-          # Группируем по исходному файлу и печатаем ровно как в UI:
-          # Errors in <file>:
-          # [STATUS] URL | reason
           jq -r '
             (.fail_map // {}) as $m
             | [ $m | to_entries[] | . as $e
@@ -132,23 +123,22 @@ jobs:
                     + "\n"
                 )
               end
-          ' "$OUT" > report.txt
+          ' "$OUT" > "$REPORT"
 
           echo "---- REPORT PREVIEW ----"
-          sed -n '1,120p' report.txt || true
+          sed -n '1,120p' "$REPORT" || true
 
-      # ---------- 4) Пишем ТОЛЬКО этот отчёт в GitHub Summary ----------
       - name: Publish Job Summary (broken only)
         shell: bash
         run: |
-          # подчистим Summary на случай мусора от прошлых шагов
+          REPORT="$GITHUB_WORKSPACE/report.txt"
           : > $GITHUB_STEP_SUMMARY
           echo "### Broken Links (lychee)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`Upstream synced:\` **${{ steps.sync.outputs.synced || 'false' }}**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```text' >> $GITHUB_STEP_SUMMARY
-          cat report.txt >> $GITHUB_STEP_SUMMARY
+          cat "$REPORT" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload artifacts
@@ -156,10 +146,10 @@ jobs:
         with:
           name: lychee-report
           path: |
-            lychee.json
-            report.txt
+            ${{ github.workspace }}/lychee.json
+            ${{ github.workspace }}/report.txt
 
-      # ---------- 5) Telegram: текст + полный файл ----------
+      # -------------- FIXED STEP ---------------
       - name: Send Telegram
         if: always()
         env:
@@ -169,25 +159,36 @@ jobs:
           SYNCED:   ${{ steps.sync.outputs.synced }}
         shell: bash
         run: |
+          set +e
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          REPORT="$GITHUB_WORKSPACE/report.txt"
 
+          echo "Workspace: $GITHUB_WORKSPACE"
+          echo "Files:"
+          ls -la "$GITHUB_WORKSPACE" || true
+
+          : > "$GITHUB_WORKSPACE/message.txt"
           {
             echo "Broken Links Report"
             echo "Broken: ${BROKEN:-0}"
             echo "Upstream synced: ${SYNCED:-false}"
             echo "Run: ${RUN_URL}"
             echo
-          } > message.txt
+          } >> "$GITHUB_WORKSPACE/message.txt"
 
-          head -c 3000 report.txt >> message.txt
+          if [ -f "$REPORT" ]; then
+            head -c 3000 "$REPORT" >> "$GITHUB_WORKSPACE/message.txt"
+          else
+            echo "(no report generated)" >> "$GITHUB_WORKSPACE/message.txt"
+          fi
 
-          # отправляем как "сырой" текст с реальными переносами строк
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -H 'content-type: application/json' \
-            -d "$(jq -Rs --arg chat "${ADMIN_ID}" '{chat_id:$chat, text:. , disable_web_page_preview:true}' < message.txt)"
+            -d "$(jq -Rs --arg chat "${ADMIN_ID}" '{chat_id:$chat, text:. , disable_web_page_preview:true}' < "$GITHUB_WORKSPACE/message.txt")"
 
-          # прикрепим ПОЛНЫЙ отчёт файлом
-          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
-            -F "chat_id=${ADMIN_ID}" \
-            -F "document=@report.txt" \
-            -F "caption=Full broken-links report"
+          if [ -f "$REPORT" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
+              -F "chat_id=${ADMIN_ID}" \
+              -F "document=@${REPORT}" \
+              -F "caption=Full broken-links report"
+          fi
