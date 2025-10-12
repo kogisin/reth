@@ -2,14 +2,14 @@ name: report.yml
 
 on:
   schedule:
-    - cron: "7 7 * * *"
+    - cron: "7 7 * * *"     # ежедневно 07:07 UTC
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
 env:
-  UPSTREAM: paradigmxyz/reth
+  UPSTREAM: paradigmxyz/reth   # поменяй при необходимости
   BRANCH: main
 
 jobs:
@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ---------- 1) SYNC ----------
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
@@ -73,7 +74,7 @@ jobs:
           echo "json=$GITHUB_WORKSPACE/lychee.json"  >> "$GITHUB_OUTPUT"
           echo "report=$GITHUB_WORKSPACE/report.txt" >> "$GITHUB_OUTPUT"
 
-      # ---------- Lychee via Docker ----------
+      # ---------- 2) LYCHEE: план А — Docker ----------
       - name: Lychee (Docker)
         id: lychee_docker
         continue-on-error: true
@@ -81,6 +82,7 @@ jobs:
         run: |
           set -e
           JSON="${{ steps.paths.outputs.json }}"
+          # ghcr может отказывать (denied) из-за лимитов → это ок, fallback покроет
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/work" \
             -w /work \
@@ -97,11 +99,11 @@ jobs:
               --exclude "http://127.0.0.1(:[0-9]+)?/" \
               --verbose \
               --format json \
-              "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts" \
-              > "$JSON"
+              --output /work/lychee.json \
+              "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
           if [ -s "$JSON" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; else echo "ok=false" >> "$GITHUB_OUTPUT"; fi
 
-      # ---------- Fallback: binary ----------
+      # ---------- 2b) LYCHEE: план Б — бинарь релиза ----------
       - name: Lychee (fallback binary)
         if: steps.lychee_docker.outputs.ok != 'true'
         id: lychee_bin
@@ -138,13 +140,13 @@ jobs:
             --exclude "http://127.0.0.1(:[0-9]+)?/" \
             --verbose \
             --format json \
-            "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts" \
-            > "$JSON"
+            --output "$JSON" \
+            "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
           set -e
 
           if [ -s "$JSON" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; else echo "ok=false" >> "$GITHUB_OUTPUT"; fi
 
-      # ---------- Build report (fail_map only) ----------
+      # ---------- 3) Отчёт только из fail_map ----------
       - name: Build broken-links report
         id: build
         shell: bash
@@ -154,7 +156,7 @@ jobs:
           : > "$REPORT"
 
           if [ ! -s "$JSON" ]; then
-            echo "Lychee JSON is missing" > "$REPORT"
+            echo "Lychee JSON is missing (docker_ok=${{ steps.lychee_docker.outputs.ok }}, bin_ok=${{ steps.lychee_bin.outputs.ok }})" > "$REPORT"
             echo "broken=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -185,8 +187,7 @@ jobs:
               end
           ' "$JSON" > "$REPORT"
 
-          sed -n '1,60p' "$REPORT" || true
-
+      # ---------- 4) GitHub Summary ----------
       - name: Publish GitHub Summary
         shell: bash
         run: |
@@ -209,6 +210,7 @@ jobs:
             ${{ steps.paths.outputs.json }}
             ${{ steps.paths.outputs.report }}
 
+      # ---------- 5) Telegram ----------
       - name: Send Telegram
         if: always()
         env:
