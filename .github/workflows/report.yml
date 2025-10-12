@@ -2,14 +2,14 @@ name: report.yml
 
 on:
   schedule:
-    - cron: "7 7 * * *"           # ежедневно 07:07 UTC
+    - cron: "7 7 * * *"
   workflow_dispatch: {}
 
 permissions:
-  contents: write                 # пуш в форк
+  contents: write
 
 env:
-  UPSTREAM: paradigmxyz/reth      # ← замени на фактический апстрим, если другой
+  UPSTREAM: paradigmxyz/reth   # поменяй при необходимости
   BRANCH: main
 
 jobs:
@@ -82,88 +82,55 @@ jobs:
             "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
           output: lychee.json
 
-      # ---------- 3) Сборка отчёта как в UI ----------
-      - name: Build “UI-like” report (summary + errors per input)
+      # ---------- 3) Построение отчёта ТОЛЬКО из fail_map ----------
+      - name: Build report (only broken links grouped by file)
         id: build
         shell: bash
         run: |
           OUT="lychee.json"
           : > report.txt
-          : > summary.json
 
-          # Если отчёт не создан — завершаем минимумом, чтобы TG и Summary не вели себя как “ОК”
           if [ ! -s "$OUT" ]; then
-            echo '{ "total": 0, "successful": 0, "errors": 0, "excludes": 0, "cached": 0, "unknown": 0, "unsupported": 0, "redirects": 0, "timeouts": 0 }' > summary.json
             echo "Lychee did not produce report (outcome=${{ steps.lychee.outcome }})" > report.txt
             echo "broken=0" >> $GITHUB_OUTPUT
           else
-            # попытка достать счетчики из разных возможных полей (lychee менял схему в версиях)
-            TOTAL=$(jq '(.stats.total // .total // 0)' "$OUT")
-            OK=$(jq '(.stats.success // .successful // (.ok // 0))' "$OUT")
-            ERR=$(jq '((.stats.errors // .errors), (.fail_map | length // 0)) | select(.!=null) | . ' "$OUT")
-            EXCL=$(jq '(.stats.excludes // .excludes // (.exclude_map | length // 0) // 0)' "$OUT")
-            CACHED=$(jq '(.stats.cached // .cached // 0)' "$OUT")
-            UNK=$(jq '(.stats.unknown // .unknown // 0)' "$OUT")
-            UNSUP=$(jq '(.stats.unsupported // .unsupported // 0)' "$OUT")
-            REDIR=$(jq '(.stats.redirects // .redirects // 0)' "$OUT")
-            TIMEO=$(jq '(.stats.timeouts // .timeouts // 0)' "$OUT")
-
-            # если ERR пустой — ставим 0
-            if [ -z "$ERR" ]; then ERR=0; fi
-
-            jq -n --argjson total "$TOTAL" --argjson ok "$OK" --argjson err "$ERR" \
-                  --argjson exc "$EXCL" --argjson cached "$CACHED" --argjson unk "$UNK" \
-                  --argjson uns "$UNSUP" --argjson red "$REDIR" --argjson tmo "$TIMEO" \
-              '{ total:$total, successful:$ok, errors:$err, excludes:$exc, cached:$cached, unknown:$unk, unsupported:$uns, redirects:$red, timeouts:$tmo }' \
-              > summary.json
-
+            # количество битых ссылок = сумма длин массивов в fail_map
+            ERR=$(jq '(.fail_map // {}) | to_entries | map(.value | length) | add // 0' "$OUT")
             echo "broken=$ERR" >> $GITHUB_OUTPUT
 
-            # Ошибки по файлам: Errors in <file>:\n[status] URL | reason
+            # плоская таблица только из fail_map: {src,url,st,err}
             jq -r '
               (.fail_map // {}) as $m
-              | reduce ($m|to_entries[]) as $e ([];
-                  . + ( $e.value
-                        | map({
-                            src: (.source.file // .source // "unknown"),
-                            st:  (.status // .code // .response?.status // .checks?[0]?.status // "ERR"),
-                            err: (.error // .reason // .message // ""),
-                            url: $e.key
-                          })
-                      )
-                )
-              | if length==0 then "No broken links." else
-                  (
-                    "Summary\n" +
-                    ( "  total:        " + ((input | .total)|tostring) + "\n" ) +
-                    ( "  successful:   " + ((input | .successful)|tostring) + "\n" ) +
-                    ( "  errors:       " + ((input | .errors)|tostring) + "\n" ) +
-                    ( "  excludes:     " + ((input | .excludes)|tostring) + "\n" ) +
-                    ( "  cached:       " + ((input | .cached)|tostring) + "\n" ) +
-                    ( "  unknown:      " + ((input | .unknown)|tostring) + "\n" ) +
-                    ( "  unsupported:  " + ((input | .unsupported)|tostring) + "\n" ) +
-                    ( "  redirects:    " + ((input | .redirects)|tostring) + "\n" ) +
-                    ( "  timeouts:     " + ((input | .timeouts)|tostring) + "\n\n" )
-                  ) as $hdr
-                  | group_by(.src)[]
-                  | "Errors in " + (.[0].src) + ":\n"
-                    + (map("[" + ( .st|tostring ) + "] " + .url + (if .err=="" then "" else " | " + .err end))
-                       | unique | join("\n"))
-                    + "\n"
-                  , $hdr
-              ' --slurpfile summary summary.json "$OUT" \
-              | awk 'BEGIN{hdr=""} { if($0 ~ /^Summary$/){hdr=$0; getline; s=$0; for(i=1;i<9;i++){getline; s=s"\n"$0} print hdr"\n"s; next } print }' \
-              > report.txt
+              | [ $m | to_entries[] | . as $e
+                  | $e.value[] | {
+                      src: (.source.file // .source // "unknown"),
+                      url: $e.key,
+                      st:  (.status // .code // .response?.status // .checks?[0]?.status // "ERR"),
+                      err: (.error // .reason // .message // "")
+                    }
+                ] as $rows
+              | if ($rows|length)==0 then
+                  "No broken links."
+                else
+                  ( $rows
+                    | group_by(.src)[]
+                    | "Errors in " + (.[0].src) + ":\n"
+                      + ( map("[" + (.st|tostring) + "] " + .url + (if .err=="" then "" else " | " + .err end))
+                          | unique | join("\n"))
+                      + "\n"
+                  )
+                end
+            ' "$OUT" > report.txt
           fi
 
-          echo "---- preview (first 120 lines) ----"
+          echo "---- preview ----"
           sed -n '1,120p' report.txt || true
 
-      # ---------- 4) Публикация отчёта в GitHub Summary ----------
-      - name: Publish GitHub job summary (Markdown)
+      # ---------- 4) GitHub Summary (как в UI: список ошибок per file) ----------
+      - name: Publish GitHub job summary
         shell: bash
         run: |
-          echo "### Link Check Report" >> $GITHUB_STEP_SUMMARY
+          echo "### Link Check — Broken Links Only" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "\`Upstream synced:\` **${{ steps.sync.outputs.synced || 'false' }}**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -177,38 +144,37 @@ jobs:
           name: lychee-report
           path: |
             lychee.json
-            summary.json
             report.txt
 
-      # ---------- 5) Telegram (тот же отчёт: коротко в сообщении + полный файлом) ----------
+      # ---------- 5) Telegram: текст + полный отчёт файлом ----------
       - name: Send Telegram
         if: always()
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
+          BROKEN:   ${{ steps.build.outputs.broken }}
           SYNCED:   ${{ steps.sync.outputs.synced }}
         shell: bash
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          # заголовок
           {
-            echo "Link Check Report"
+            echo "Link Check — Broken Links Only"
+            echo "Broken: ${BROKEN:-0}"
             echo "Upstream synced: ${SYNCED:-false}"
             echo "Run: ${RUN_URL}"
             echo
           } > message.txt
 
-          # добавим первые ~3000 символов отчёта (чтобы точно влезло в 4096)
+          # первые ~3000 символов текста для sendMessage (лимит телеги ~4096)
           head -c 3000 report.txt >> message.txt
 
-          # Отправляем текст как raw-string (с реальными переносами)
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -H 'content-type: application/json' \
             -d "$(jq -Rs --arg chat "${ADMIN_ID}" '{chat_id:$chat, text:. , disable_web_page_preview:true}' < message.txt)"
 
-          # Прикрепим ПОЛНЫЙ отчёт файлом
+          # полный отчёт файлом
           curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
             -F "chat_id=${ADMIN_ID}" \
             -F "document=@report.txt" \
-            -F "caption=Full link check report"
+            -F "caption=Full broken-links report"
