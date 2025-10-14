@@ -20,7 +20,7 @@ jobs:
       - name: Check links
         uses: lycheeverse/lychee-action@v2.2.0
         with:
-          args: --no-progress --accept 200,429 --exclude "http://localhost(:[0-9]+)?/" --exclude "enode://*" --exclude "http://127.0.0.1(:[0-9]+)?/" --verbose "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts"
+          args: --no-progress --accept 200,429 --exclude "http://localhost(:[0-9]+)?/" --exclude "enode://*" --exclude "http://127.0.0.1(:[0-9]+)?/" --verbose "**/*.md" "**/*.mdx" "**/*.tsx" "**/*.rs" "**/*.ts" "**/*.json" "**/*.sh" "**/*.py" "**/*.js" "**/*.jsx"
 
   spellcheck:
     runs-on: ubuntu-latest
