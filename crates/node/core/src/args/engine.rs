@@ -30,9 +30,9 @@ pub struct EngineArgs {
     #[deprecated]
     pub caching_and_prewarming_enabled: bool,
 
-    /// Disable cross-block caching and parallel prewarming
-    #[arg(long = "engine.disable-caching-and-prewarming")]
-    pub caching_and_prewarming_disabled: bool,
+    /// Disable parallel prewarming
+    #[arg(long = "engine.disable-prewarming", alias = "engine.disable-caching-and-prewarming")]
+    pub prewarming_disabled: bool,
 
     /// CAUTION: This CLI flag has no effect anymore, use --engine.disable-parallel-sparse-trie
     /// if you want to disable usage of the `ParallelSparseTrie`.
@@ -113,6 +113,11 @@ pub struct EngineArgs {
     /// If not specified, defaults to 2x available parallelism, clamped between 2 and 64.
     #[arg(long = "engine.storage-worker-count")]
     pub storage_worker_count: Option<usize>,
+
+    /// Configure the number of account proof workers in the Tokio blocking pool.
+    /// If not specified, defaults to the same count as storage workers.
+    #[arg(long = "engine.account-worker-count")]
+    pub account_worker_count: Option<usize>,
 }
 
 #[allow(deprecated)]
@@ -124,7 +129,7 @@ impl Default for EngineArgs {
             legacy_state_root_task_enabled: false,
             state_root_task_compare_updates: false,
             caching_and_prewarming_enabled: true,
-            caching_and_prewarming_disabled: false,
+            prewarming_disabled: false,
             parallel_sparse_trie_enabled: true,
             parallel_sparse_trie_disabled: false,
             state_provider_metrics: false,
@@ -140,6 +145,7 @@ impl Default for EngineArgs {
             always_process_payload_attributes_on_canonical_head: false,
             allow_unwind_canonical_header: false,
             storage_worker_count: None,
+            account_worker_count: None,
         }
     }
 }
@@ -151,7 +157,7 @@ impl EngineArgs {
             .with_persistence_threshold(self.persistence_threshold)
             .with_memory_block_buffer_target(self.memory_block_buffer_target)
             .with_legacy_state_root(self.legacy_state_root_task_enabled)
-            .without_caching_and_prewarming(self.caching_and_prewarming_disabled)
+            .without_prewarming(self.prewarming_disabled)
             .with_disable_parallel_sparse_trie(self.parallel_sparse_trie_disabled)
             .with_state_provider_metrics(self.state_provider_metrics)
             .with_always_compare_trie_updates(self.state_root_task_compare_updates)
@@ -169,6 +175,10 @@ impl EngineArgs {
 
         if let Some(count) = self.storage_worker_count {
             config = config.with_storage_worker_count(count);
+        }
+
+        if let Some(count) = self.account_worker_count {
+            config = config.with_account_worker_count(count);
         }
 
         config

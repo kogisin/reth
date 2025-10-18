@@ -84,7 +84,7 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
             db,
             chain_spec,
             static_file_provider,
-            prune_modes: PruneModes::none(),
+            prune_modes: PruneModes::default(),
             storage: Default::default(),
         }
     }
@@ -111,6 +111,11 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
     pub fn into_db(self) -> N::DB {
         self.db
     }
+
+    /// Returns reference to the prune modes.
+    pub const fn prune_modes_ref(&self) -> &PruneModes {
+        &self.prune_modes
+    }
 }
 
 impl<N: NodeTypesWithDB<DB = Arc<DatabaseEnv>>> ProviderFactory<N> {
@@ -126,7 +131,7 @@ impl<N: NodeTypesWithDB<DB = Arc<DatabaseEnv>>> ProviderFactory<N> {
             db: Arc::new(init_db(path, args).map_err(RethError::msg)?),
             chain_spec,
             static_file_provider,
-            prune_modes: PruneModes::none(),
+            prune_modes: PruneModes::default(),
             storage: Default::default(),
         })
     }
@@ -665,7 +670,7 @@ mod tests {
             let prune_modes = PruneModes {
                 sender_recovery: Some(PruneMode::Full),
                 transaction_lookup: Some(PruneMode::Full),
-                ..PruneModes::none()
+                ..PruneModes::default()
             };
             let factory = create_test_provider_factory();
             let provider = factory.with_prune_modes(prune_modes).provider_rw().unwrap();
