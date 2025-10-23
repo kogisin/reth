@@ -741,7 +741,7 @@ impl SparseTrieInterface for ParallelSparseTrie {
         // Update subtrie hashes in parallel
         {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            use tracing::info_span;
+            use tracing::debug_span;
 
             let (tx, rx) = mpsc::channel();
 
@@ -751,8 +751,8 @@ impl SparseTrieInterface for ParallelSparseTrie {
             changed_subtries
                 .into_par_iter()
                 .map(|mut changed_subtrie| {
-                    let _enter = info_span!(
-                        target: "trie::sparse::parallel",
+                    let _enter = debug_span!(
+                        target: "trie::parallel_sparse",
                         parent: span.clone(),
                         "subtrie",
                         index = changed_subtrie.index
@@ -882,6 +882,42 @@ impl SparseTrieInterface for ParallelSparseTrie {
     fn value_capacity(&self) -> usize {
         self.upper_subtrie.value_capacity() +
             self.lower_subtries.iter().map(|trie| trie.value_capacity()).sum::<usize>()
+    }
+
+    fn shrink_nodes_to(&mut self, size: usize) {
+        // Distribute the capacity across upper and lower subtries
+        //
+        // Always include upper subtrie, plus any lower subtries
+        let total_subtries = 1 + NUM_LOWER_SUBTRIES;
+        let size_per_subtrie = size / total_subtries;
+
+        // Shrink the upper subtrie
+        self.upper_subtrie.shrink_nodes_to(size_per_subtrie);
+
+        // Shrink lower subtries (works for both revealed and blind with allocation)
+        for subtrie in &mut self.lower_subtries {
+            subtrie.shrink_nodes_to(size_per_subtrie);
+        }
+
+        // shrink masks maps
+        self.branch_node_hash_masks.shrink_to(size);
+        self.branch_node_tree_masks.shrink_to(size);
+    }
+
+    fn shrink_values_to(&mut self, size: usize) {
+        // Distribute the capacity across upper and lower subtries
+        //
+        // Always include upper subtrie, plus any lower subtries
+        let total_subtries = 1 + NUM_LOWER_SUBTRIES;
+        let size_per_subtrie = size / total_subtries;
+
+        // Shrink the upper subtrie
+        self.upper_subtrie.shrink_values_to(size_per_subtrie);
+
+        // Shrink lower subtries (works for both revealed and blind with allocation)
+        for subtrie in &mut self.lower_subtries {
+            subtrie.shrink_values_to(size_per_subtrie);
+        }
     }
 }
 
@@ -1303,7 +1339,7 @@ impl ParallelSparseTrie {
 
     /// Drains any [`SparseTrieUpdatesAction`]s from the given subtrie, and applies each action to
     /// the given `updates` set. If the given set is None then this is a no-op.
-    #[instrument(target = "trie::sparse::parallel", skip_all)]
+    #[instrument(target = "trie::parallel_sparse", skip_all)]
     fn apply_subtrie_update_actions(
         &mut self,
         update_actions: impl Iterator<Item = SparseTrieUpdatesAction>,
@@ -1405,7 +1441,7 @@ impl ParallelSparseTrie {
     ///
     /// IMPORTANT: The method removes the subtries from `lower_subtries`, and the caller is
     /// responsible for returning them back into the array.
-    #[instrument(target = "trie::sparse::parallel", skip_all, fields(prefix_set_len = prefix_set.len()))]
+    #[instrument(target = "trie::parallel_sparse", skip_all, fields(prefix_set_len = prefix_set.len()))]
     fn take_changed_lower_subtries(
         &mut self,
         prefix_set: &mut PrefixSet,
@@ -1562,7 +1598,7 @@ impl ParallelSparseTrie {
 
     /// Return updated subtries back to the trie after executing any actions required on the
     /// top-level `SparseTrieUpdates`.
-    #[instrument(target = "trie::sparse::parallel", skip_all)]
+    #[instrument(target = "trie::parallel_sparse", skip_all)]
     fn insert_changed_subtries(
         &mut self,
         changed_subtries: impl IntoIterator<Item = ChangedSubtrie>,
@@ -2111,6 +2147,16 @@ impl SparseSubtrie {
     pub(crate) fn value_capacity(&self) -> usize {
         self.inner.value_capacity()
     }
+
+    /// Shrinks the capacity of the subtrie's node storage.
+    pub(crate) fn shrink_nodes_to(&mut self, size: usize) {
+        self.nodes.shrink_to(size);
+    }
+
+    /// Shrinks the capacity of the subtrie's value storage.
+    pub(crate) fn shrink_values_to(&mut self, size: usize) {
+        self.inner.values.shrink_to(size);
+    }
 }
 
 /// Helper type for [`SparseSubtrie`] to mutably access only a subset of fields from the original
@@ -2571,10 +2617,19 @@ impl SparseSubtrieBuffers {
     /// Clears all buffers.
     fn clear(&mut self) {
         self.path_stack.clear();
+        self.path_stack.shrink_to_fit();
+
         self.rlp_node_stack.clear();
+        self.rlp_node_stack.shrink_to_fit();
+
         self.branch_child_buf.clear();
+        self.branch_child_buf.shrink_to_fit();
+
         self.branch_value_stack_buf.clear();
+        self.branch_value_stack_buf.shrink_to_fit();
+
         self.rlp_buf.clear();
+        self.rlp_buf.shrink_to_fit();
     }
 }
 
