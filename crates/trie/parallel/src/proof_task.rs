@@ -1319,6 +1319,11 @@ where
             TrieElement::Leaf(hashed_address, account) => {
                 let root = match storage_proof_receivers.remove(&hashed_address) {
                     Some(receiver) => {
+                        let _guard = debug_span!(
+                            target: "trie::proof_task",
+                            "Waiting for storage proof",
+                            ?hashed_address,
+                        );
                         // Block on this specific storage proof receiver - enables interleaved
                         // parallelism
                         let proof_msg = receiver.recv().map_err(|_| {
@@ -1330,6 +1335,8 @@ where
                                 ),
                             )
                         })?;
+
+                        drop(_guard);
 
                         // Extract storage proof from the result
                         let proof = match proof_msg.result? {
