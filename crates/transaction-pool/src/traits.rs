@@ -177,16 +177,6 @@ pub trait TransactionPool: Clone + Debug + Send + Sync {
         transactions: Vec<Self::Transaction>,
     ) -> impl Future<Output = Vec<PoolResult<AddedTransactionOutcome>>> + Send;
 
-    /// Adds multiple _unvalidated_ transactions with individual origins.
-    ///
-    /// Each transaction can have its own [`TransactionOrigin`].
-    ///
-    /// Consumer: RPC
-    fn add_transactions_with_origins(
-        &self,
-        transactions: Vec<(TransactionOrigin, Self::Transaction)>,
-    ) -> impl Future<Output = Vec<PoolResult<AddedTransactionOutcome>>> + Send;
-
     /// Submit a consensus transaction directly to the pool
     fn add_consensus_transaction(
         &self,
@@ -1224,6 +1214,11 @@ pub trait PoolTransaction:
         } else {
             Ok(())
         }
+    }
+
+    /// Allows to communicate to the pool that the transaction doesn't require a nonce check.
+    fn requires_nonce_check(&self) -> bool {
+        true
     }
 }
 
