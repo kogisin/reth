@@ -24,7 +24,7 @@ jobs:
   prepare-hive:
     if: github.repository == 'paradigmxyz/reth'
     timeout-minutes: 45
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest-16
     steps:
       - uses: actions/checkout@v6
       - name: Checkout hive tests
@@ -44,7 +44,7 @@ jobs:
 
       - name: Restore hive assets cache
         id: cache-hive
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ./hive_assets
           key: hive-assets-${{ steps.hive-commit.outputs.hash }}-${{ hashFiles('.github/assets/hive/build_simulators.sh') }}
@@ -178,7 +178,7 @@ jobs:
       - prepare-reth
       - prepare-hive
     name: run ${{ matrix.scenario.sim }}${{ matrix.scenario.limit && format(' - {0}', matrix.scenario.limit) }}
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest-16
     permissions:
       issues: write
     steps:
