@@ -15,7 +15,10 @@ use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_db_api::{database::Database, database_metrics::DatabaseMetrics};
 use reth_exex::ExExContext;
 use reth_network::{
-    transactions::{TransactionPropagationPolicy, TransactionsManagerConfig},
+    transactions::{
+        config::{AnnouncementFilteringPolicy, StrictEthAnnouncementFilter},
+        TransactionPropagationPolicy, TransactionsManagerConfig,
+    },
     NetworkBuilder, NetworkConfig, NetworkConfigBuilder, NetworkHandle, NetworkManager,
     NetworkPrimitives,
 };
@@ -76,7 +79,7 @@ pub type RethFullAdapter<DB, Types> =
 /// configured components and can interact with the node.
 ///
 /// There are convenience functions for networks that come with a preset of types and components via
-/// the [`Node`] trait, see `reth_node_ethereum::EthereumNode` or `reth_optimism_node::OpNode`.
+/// the [`Node`] trait, see `reth_node_ethereum::EthereumNode`.
 ///
 /// The [`NodeBuilder::node`] function configures the node's types and components in one step.
 ///
@@ -248,6 +251,8 @@ impl<DB, ChainSpec: EthChainSpec> NodeBuilder<DB, ChainSpec> {
     }
 
     /// Creates a preconfigured node for testing purposes with a specific datadir.
+    ///
+    /// The entire `datadir` will be cleaned up when the node is dropped.
     #[cfg(feature = "test-utils")]
     pub fn testing_node_with_datadir(
         mut self,
@@ -265,7 +270,7 @@ impl<DB, ChainSpec: EthChainSpec> NodeBuilder<DB, ChainSpec> {
         let data_dir =
             path.unwrap_or_chain_default(self.config.chain.chain(), self.config.datadir.clone());
 
-        let db = reth_db::test_utils::create_test_rw_db_with_path(data_dir.db());
+        let db = reth_db::test_utils::create_test_rw_db_with_datadir(data_dir.data_dir());
 
         WithLaunchContext { builder: self.with_database(db), task_executor }
     }
@@ -832,6 +837,7 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
     /// Convenience function to start the network tasks.
     ///
     /// Accepts the config for the transaction task and the policy for propagation.
+    /// Uses the default [`StrictEthAnnouncementFilter`] for announcement filtering.
     ///
     /// Spawns the configured network and associated tasks and returns the [`NetworkHandle`]
     /// connected to that network.
@@ -854,13 +860,51 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
         Node::Provider: BlockReaderFor<N>,
         Policy: TransactionPropagationPolicy<N>,
     {
+        self.start_network_with_policies(
+            builder,
+            pool,
+            tx_config,
+            propagation_policy,
+            StrictEthAnnouncementFilter::default(),
+        )
+    }
+
+    /// Convenience function to start the network tasks with custom policies.
+    ///
+    /// Accepts the config for the transaction task, the policy for propagation,
+    /// and a custom announcement filter. This is useful for configuring which tx types are accepted
+    /// in announcements.
+    ///
+    /// Spawns the configured network and associated tasks and returns the [`NetworkHandle`]
+    /// connected to that network.
+    pub fn start_network_with_policies<Pool, N, PropPolicy, AnnPolicy>(
+        &self,
+        builder: NetworkBuilder<(), (), N>,
+        pool: Pool,
+        tx_config: TransactionsManagerConfig,
+        propagation_policy: PropPolicy,
+        announcement_policy: AnnPolicy,
+    ) -> NetworkHandle<N>
+    where
+        N: NetworkPrimitives,
+        Pool: TransactionPool<
+                Transaction: PoolTransaction<
+                    Consensus = N::BroadcastedTransaction,
+                    Pooled = N::PooledTransaction,
+                >,
+            > + Unpin
+            + 'static,
+        Node::Provider: BlockReaderFor<N>,
+        PropPolicy: TransactionPropagationPolicy<N>,
+        AnnPolicy: AnnouncementFilteringPolicy<N>,
+    {
         let (handle, network, txpool, eth) = builder
-            .transactions_with_policy(pool, tx_config, propagation_policy)
+            .transactions_with_policies(pool, tx_config, propagation_policy, announcement_policy)
             .request_handler(self.provider().clone())
             .split_with_handle();
 
-        self.executor.spawn_critical_blocking("p2p txpool", Box::pin(txpool));
-        self.executor.spawn_critical_blocking("p2p eth request handler", Box::pin(eth));
+        self.executor.spawn_critical_blocking_task("p2p txpool", Box::pin(txpool));
+        self.executor.spawn_critical_blocking_task("p2p eth request handler", Box::pin(eth));
 
         let default_peers_path = self.config().datadir().known_peers();
         let known_peers_file = self.config().network.persistent_peers_file(default_peers_path);

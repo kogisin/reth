@@ -15,7 +15,7 @@ use reth_provider::{
 };
 use reth_rpc_server_types::RpcModuleSelection;
 use reth_stages_types::StageId;
-use reth_tasks::TaskManager;
+use reth_tasks::Runtime;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
 use tracing::{debug, info, span, Level};
@@ -24,8 +24,6 @@ use tracing::{debug, info, span, Level};
 pub struct ChainImportResult {
     /// The nodes that were created
     pub nodes: Vec<NodeHelperType<EthereumNode>>,
-    /// The task manager
-    pub task_manager: TaskManager,
     /// The wallet for testing
     pub wallet: Wallet,
     /// Temporary directories that must be kept alive for the duration of the test
@@ -68,8 +66,7 @@ pub async fn setup_engine_with_chain_import(
         + Copy
         + 'static,
 ) -> eyre::Result<ChainImportResult> {
-    let tasks = TaskManager::current();
-    let exec = tasks.executor();
+    let runtime = Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
 
     let network_config = NetworkArgs {
         discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
@@ -113,21 +110,24 @@ pub async fn setup_engine_with_chain_import(
         let rocksdb_dir_path = datadir.join("rocksdb");
 
         // Initialize the database using init_db (same as CLI import command)
-        // Use the same database arguments as the node will use
         let db_args = reth_node_core::args::DatabaseArgs::default().database_args();
-        let db_env = reth_db::init_db(&db_path, db_args)?;
-        let db = Arc::new(db_env);
+        let db = reth_db::init_db(&db_path, db_args)?;
 
         // Create a provider factory with the initialized database (use regular DB, not
         // TempDatabase) We need to specify the node types properly for the adapter
-        let provider_factory = ProviderFactory::<
-            NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>,
-        >::new(
-            db.clone(),
-            chain_spec.clone(),
-            reth_provider::providers::StaticFileProvider::read_write(static_files_path.clone())?,
-            reth_provider::providers::RocksDBProvider::builder(rocksdb_dir_path).build().unwrap(),
-        )?;
+        let provider_factory =
+            ProviderFactory::<NodeTypesWithDBAdapter<EthereumNode, DatabaseEnv>>::new(
+                db.clone(),
+                chain_spec.clone(),
+                reth_provider::providers::StaticFileProvider::read_write(
+                    static_files_path.clone(),
+                )?,
+                reth_provider::providers::RocksDBProvider::builder(rocksdb_dir_path)
+                    .with_default_tables()
+                    .build()
+                    .unwrap(),
+                reth_tasks::Runtime::test(),
+            )?;
 
         // Initialize genesis if needed
         reth_db_common::init::init_genesis(&provider_factory)?;
@@ -219,7 +219,7 @@ pub async fn setup_engine_with_chain_import(
         let node = EthereumNode::default();
 
         let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config.clone())
-            .testing_node_with_datadir(exec.clone(), datadir.clone())
+            .testing_node_with_datadir(runtime.clone(), datadir.clone())
             .with_types_and_provider::<EthereumNode, BlockchainProvider<_>>()
             .with_components(node.components_builder())
             .with_add_ons(node.add_ons())
@@ -241,7 +241,6 @@ pub async fn setup_engine_with_chain_import(
 
     Ok(ChainImportResult {
         nodes,
-        task_manager: tasks,
         wallet: crate::Wallet::default().with_chain_id(chain_spec.chain.id()),
         _temp_dirs: temp_dirs,
     })
@@ -317,19 +316,21 @@ mod tests {
 
         // Import the chain
         {
-            let db_env = reth_db::init_db(&db_path, DatabaseArguments::default()).unwrap();
-            let db = Arc::new(db_env);
+            let db_args = reth_node_core::args::DatabaseArgs::default().database_args();
+            let db = reth_db::init_db(&db_path, db_args).unwrap();
 
             let provider_factory: ProviderFactory<
-                NodeTypesWithDBAdapter<reth_node_ethereum::EthereumNode, Arc<DatabaseEnv>>,
+                NodeTypesWithDBAdapter<reth_node_ethereum::EthereumNode, DatabaseEnv>,
             > = ProviderFactory::new(
                 db.clone(),
                 chain_spec.clone(),
                 reth_provider::providers::StaticFileProvider::read_write(static_files_path.clone())
                     .unwrap(),
                 reth_provider::providers::RocksDBProvider::builder(rocksdb_dir_path.clone())
+                    .with_default_tables()
                     .build()
                     .unwrap(),
+                reth_tasks::Runtime::test(),
             )
             .expect("failed to create provider factory");
 
@@ -381,19 +382,20 @@ mod tests {
 
         // Now reopen the database and verify checkpoints are still there
         {
-            let db_env = reth_db::init_db(&db_path, DatabaseArguments::default()).unwrap();
-            let db = Arc::new(db_env);
+            let db = reth_db::init_db(&db_path, DatabaseArguments::default()).unwrap();
 
             let provider_factory: ProviderFactory<
-                NodeTypesWithDBAdapter<reth_node_ethereum::EthereumNode, Arc<DatabaseEnv>>,
+                NodeTypesWithDBAdapter<reth_node_ethereum::EthereumNode, DatabaseEnv>,
             > = ProviderFactory::new(
                 db,
                 chain_spec.clone(),
                 reth_provider::providers::StaticFileProvider::read_only(static_files_path, false)
                     .unwrap(),
                 reth_provider::providers::RocksDBProvider::builder(rocksdb_dir_path)
+                    .with_default_tables()
                     .build()
                     .unwrap(),
+                reth_tasks::Runtime::test(),
             )
             .expect("failed to create provider factory");
 
@@ -475,7 +477,8 @@ mod tests {
         let datadir = temp_dir.path().join("datadir");
         std::fs::create_dir_all(&datadir).unwrap();
         let db_path = datadir.join("db");
-        let db_env = reth_db::init_db(&db_path, DatabaseArguments::default()).unwrap();
+        let db_args = reth_node_core::args::DatabaseArgs::default().database_args();
+        let db_env = reth_db::init_db(&db_path, db_args).unwrap();
         let db = Arc::new(reth_db::test_utils::TempDatabase::new(db_env, db_path));
 
         // Create static files path
@@ -489,7 +492,11 @@ mod tests {
             db.clone(),
             chain_spec.clone(),
             reth_provider::providers::StaticFileProvider::read_write(static_files_path).unwrap(),
-            reth_provider::providers::RocksDBProvider::builder(rocksdb_dir_path).build().unwrap(),
+            reth_provider::providers::RocksDBProvider::builder(rocksdb_dir_path)
+                .with_default_tables()
+                .build()
+                .unwrap(),
+            reth_tasks::Runtime::test(),
         )
         .expect("failed to create provider factory");
 

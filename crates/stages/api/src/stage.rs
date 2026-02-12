@@ -344,11 +344,11 @@ mod tests {
             create_test_rw_db(),
             MAINNET.clone(),
             StaticFileProviderBuilder::read_write(create_test_static_files_dir().0.keep())
-                .unwrap()
                 .with_blocks_per_file(1)
                 .build()
                 .unwrap(),
             RocksDBProvider::builder(create_test_rocksdb_dir().0.keep()).build().unwrap(),
+            reth_tasks::Runtime::test(),
         )
         .unwrap();
 

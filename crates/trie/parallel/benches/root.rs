@@ -38,7 +38,8 @@ pub fn calculate_state_root(c: &mut Criterion) {
             provider_rw.commit().unwrap();
         }
 
-        let factory = OverlayStateProviderFactory::new(provider_factory.clone());
+        let changeset_cache = reth_trie_db::ChangesetCache::new();
+        let factory = OverlayStateProviderFactory::new(provider_factory.clone(), changeset_cache);
 
         // state root
         group.bench_function(BenchmarkId::new("sync root", size), |b| {
@@ -67,7 +68,11 @@ pub fn calculate_state_root(c: &mut Criterion) {
             b.iter_with_setup(
                 || {
                     let trie_input = TrieInput::from_state(updated_state.clone());
-                    ParallelStateRoot::new(factory.clone(), trie_input.prefix_sets.freeze())
+                    ParallelStateRoot::new(
+                        factory.clone(),
+                        trie_input.prefix_sets.freeze(),
+                        reth_tasks::Runtime::test(),
+                    )
                 },
                 |calculator| calculator.incremental_root(),
             );

@@ -18,13 +18,13 @@ Reth is a high-performance Ethereum execution client written in Rust, focusing o
 6. **Pipeline (`crates/stages/`)**: Staged sync architecture for blockchain synchronization
 7. **Trie (`crates/trie/`)**: Merkle Patricia Trie implementation with parallel state root computation
 8. **Node Builder (`crates/node/`)**: High-level node orchestration and configuration
-9  **The Consensus Engine (`crates/engine/`)**: Handles processing blocks received from the consensus layer with the Engine API (newPayload, forkchoiceUpdated)
+9. **The Consensus Engine (`crates/engine/`)**: Handles processing blocks received from the consensus layer with the Engine API (newPayload, forkchoiceUpdated)
 
 ### Key Design Principles
 
 - **Modularity**: Each crate can be used as a standalone library
 - **Performance**: Extensive use of parallelism, memory-mapped I/O, and optimized data structures
-- **Extensibility**: Traits and generic types allow for different implementations (Ethereum, Optimism, etc.)
+- **Extensibility**: Traits and generic types allow for different chain implementations
 - **Type Safety**: Strong typing throughout with minimal use of dynamic dispatch
 
 ## Development Workflow
@@ -38,7 +38,7 @@ Reth is a high-performance Ethereum execution client written in Rust, focusing o
 
 2. **Linting**: Run clippy with all features
    ```bash
-   RUSTFLAGS="-D warnings" cargo +nightly clippy --workspace --lib --examples --tests --benches --all-features --locked
+   cargo +nightly clippy --workspace --lib --examples --tests --benches --all-features 
    ```
 
 3. **Testing**: Use nextest for faster test execution
@@ -169,18 +169,16 @@ Based on PR patterns, avoid:
 Before submitting changes, ensure:
 
 1. **Format Check**: `cargo +nightly fmt --all --check`
-2. **Clippy**: No warnings with `RUSTFLAGS="-D warnings"`
+2. **Clippy**: No warnings
 3. **Tests Pass**: All unit and integration tests
 4. **Documentation**: Update relevant docs and add doc comments with `cargo docs --document-private-items`
 5. **Commit Messages**: Follow conventional format (feat:, fix:, chore:, etc.)
-
 
 ### Opening PRs against <https://github.com/paradigmxyz/reth>
 
 Label PRs appropriately, first check the available labels and then apply the relevant ones:
 * when changes are RPC related, add A-rpc label
 * when changes are docs related, add C-docs label
-* when changes are optimism related (e.g. new feature or exclusive changes to crates/optimism), add A-op-reth label
 * ... and so on, check the available labels for more options.
 * if being tasked to open a pr, ensure that all changes are properly formatted: `cargo +nightly fmt --all`
 
@@ -234,7 +232,7 @@ Tests often need expansion for:
 Common refactoring pattern:
 - Replace concrete types with generics
 - Add trait bounds for flexibility
-- Enable reuse across different chain types (Ethereum, Optimism)
+- Enable reuse across different chain types
 
 #### When to Comment
 
@@ -249,7 +247,7 @@ Write comments that remain valuable after the PR is merged. Future readers won't
 unsafe impl GlobalAlloc for LimitedAllocator { ... }
 
 // Binary search requires sorted input. Panics on unsorted slices.
-fn find_index(items: &[Item], target: &Item) -> Option
+fn find_index(items: &[Item], target: &Item) -> Option<usize>
 
 // Timeout set to 5s to match EVM block processing limits
 const TRACER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -349,11 +347,11 @@ Let's say you want to fix a bug where external IP resolution fails on startup:
    }
    ```
 
-5. **Run checks**:
+5. **Run checks** (IMPORTANT!):
    ```bash
    cargo +nightly fmt --all
-   cargo clippy --all-features
-   cargo test -p reth-discv4
+   cargo clippy --workspace --all-features # Make sure WHOLE WORKSPACE compiles!
+   cargo nextest run -p reth-discv4
    ```
 
 6. **Commit with clear message**:
@@ -374,7 +372,7 @@ Let's say you want to fix a bug where external IP resolution fails on startup:
 cargo +nightly fmt --all
 
 # Run lints
-RUSTFLAGS="-D warnings" cargo +nightly clippy --workspace --all-features --locked
+cargo +nightly clippy --workspace --all-features
 
 # Run tests
 cargo nextest run --workspace
@@ -383,7 +381,7 @@ cargo nextest run --workspace
 cargo bench --bench bench_name
 
 # Build optimized binary
-cargo build --release --features "jemalloc asm-keccak"
+cargo build --release
 
 # Check compilation for all features
 cargo check --workspace --all-features
