@@ -2,8 +2,8 @@
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, RocksDbArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, JitArgs, NetworkArgs,
+        PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
@@ -15,6 +15,7 @@ use eyre::eyre;
 use reth_chainspec::{ChainSpec, EthChainSpec, MAINNET};
 use reth_config::config::PruneConfig;
 use reth_engine_local::MiningMode;
+use reth_engine_primitives::TreeConfig;
 use reth_ethereum_forks::{EthereumHardforks, Head};
 use reth_network_p2p::headers::client::HeadersClient;
 use reth_primitives_traits::SealedHeader;
@@ -152,11 +153,11 @@ pub struct NodeConfig<ChainSpec> {
     /// All static files related arguments
     pub static_files: StaticFilesArgs,
 
-    /// All `RocksDB` table routing arguments
-    pub rocksdb: RocksDbArgs,
-
-    /// Storage mode configuration (v2 vs v1/legacy)
+    /// All storage related arguments with --storage prefix
     pub storage: StorageArgs,
+
+    /// All JIT related arguments with --jit prefix
+    pub jit: JitArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -188,9 +189,14 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine: EngineArgs::default(),
             era: EraArgs::default(),
             static_files: StaticFilesArgs::default(),
-            rocksdb: RocksDbArgs::default(),
             storage: StorageArgs::default(),
+            jit: JitArgs::default(),
         }
+    }
+
+    /// Creates a [`TreeConfig`] from all node arguments that affect the engine tree.
+    pub fn tree_config(&self) -> TreeConfig {
+        self.engine.tree_config().with_skip_state_root(self.debug.skip_state_root)
     }
 
     /// Sets --dev mode for the node.
@@ -264,8 +270,8 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine,
             era,
             static_files,
-            rocksdb,
             storage,
+            jit,
             ..
         } = self;
         NodeConfig {
@@ -285,8 +291,8 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine,
             era,
             static_files,
-            rocksdb,
             storage,
+            jit,
         }
     }
 
@@ -349,9 +355,23 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         self
     }
 
+    /// Set the dev block time for the node.
+    ///
+    /// This sets the interval at which the dev miner produces new blocks.
+    pub const fn with_dev_block_time(mut self, block_time: std::time::Duration) -> Self {
+        self.dev.block_time = Some(block_time);
+        self
+    }
+
     /// Set the pruning args for the node
     pub fn with_pruning(mut self, pruning: PruningArgs) -> Self {
         self.pruning = pruning;
+        self
+    }
+
+    /// Set the storage args for the node
+    pub const fn with_storage(mut self, storage: StorageArgs) -> Self {
+        self.storage = storage;
         self
     }
 
@@ -363,42 +383,17 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         self.pruning.prune_config(&self.chain)
     }
 
-    /// Returns the effective storage settings derived from `--storage.v2`, static-file, and
-    /// `RocksDB` CLI args.
+    /// Returns the effective storage settings for this node.
     ///
-    /// The base storage mode is determined by `--storage.v2`:
-    /// - When `--storage.v2` is set: uses [`StorageSettings::v2()`] defaults
-    /// - Otherwise: uses [`StorageSettings::v1()`] defaults
-    ///
-    /// Individual `--static-files.*` and `--rocksdb.*` flags override the base when explicitly set.
+    /// Determined by the `--storage.v2` flag (defaults to `true`).
+    /// Existing databases retain whatever settings are persisted in their
+    /// metadata (checked during genesis init).
     pub const fn storage_settings(&self) -> StorageSettings {
-        let mut s = if self.storage.v2 { StorageSettings::v2() } else { StorageSettings::base() };
-
-        // Apply static files overrides (only when explicitly set)
-        s = s
-            .with_receipts_in_static_files_opt(self.static_files.receipts)
-            .with_transaction_senders_in_static_files_opt(self.static_files.transaction_senders)
-            .with_account_changesets_in_static_files_opt(self.static_files.account_changesets)
-            .with_storage_changesets_in_static_files_opt(self.static_files.storage_changesets);
-
-        // Apply rocksdb overrides
-        // --rocksdb.all sets all rocksdb flags to true
-        if self.rocksdb.all {
-            s = s
-                .with_transaction_hash_numbers_in_rocksdb(true)
-                .with_storages_history_in_rocksdb(true)
-                .with_account_history_in_rocksdb(true);
+        if self.storage.v2 {
+            StorageSettings::v2()
+        } else {
+            StorageSettings::v1()
         }
-
-        // Individual rocksdb flags override --rocksdb.all when explicitly set
-        s = s
-            .with_transaction_hash_numbers_in_rocksdb_opt(self.rocksdb.tx_hash)
-            .with_storages_history_in_rocksdb_opt(self.rocksdb.storages_history)
-            .with_account_history_in_rocksdb_opt(self.rocksdb.account_history);
-
-        s = s.with_use_hashed_state(self.storage.use_hashed_state);
-
-        s
     }
 
     /// Returns the max block that the node should run to, looking it up from the network if
@@ -595,8 +590,8 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine: self.engine,
             era: self.era,
             static_files: self.static_files,
-            rocksdb: self.rocksdb,
             storage: self.storage,
+            jit: self.jit,
         }
     }
 
@@ -638,8 +633,22 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             engine: self.engine.clone(),
             era: self.era.clone(),
             static_files: self.static_files,
-            rocksdb: self.rocksdb,
             storage: self.storage,
+            jit: self.jit.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_config_applies_debug_skip_state_root() {
+        let config = NodeConfig::default();
+        assert!(!config.tree_config().skip_state_root());
+
+        let config = config.with_debug(DebugArgs { skip_state_root: true, ..Default::default() });
+        assert!(config.tree_config().skip_state_root());
     }
 }

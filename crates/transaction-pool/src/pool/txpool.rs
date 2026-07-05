@@ -28,16 +28,20 @@ use alloy_consensus::constants::{
 use alloy_eips::{
     eip1559::{ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE},
     eip4844::BLOB_TX_MIN_BLOB_GASPRICE,
-    Typed2718,
 };
 #[cfg(test)]
 use alloy_primitives::Address;
-use alloy_primitives::{map::AddressSet, TxHash, B256};
+use alloy_primitives::{
+    map::{AddressSet, B256Map, B256Set},
+    TxHash, B256,
+};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+#[cfg(test)]
+use std::collections::{HashMap, HashSet};
 use std::{
     cmp::Ordering,
-    collections::{btree_map::Entry, hash_map, BTreeMap, HashMap, HashSet},
+    collections::{btree_map::Entry, hash_map, BTreeMap},
     fmt,
     ops::Bound::{Excluded, Unbounded},
     sync::Arc,
@@ -351,15 +355,25 @@ impl<T: TransactionOrdering> TxPool<T> {
 
     /// Sets the current block info for the pool.
     ///
-    /// This will also apply updates to the pool based on the new base fee and blob fee
-    pub fn set_block_info(&mut self, info: BlockInfo) {
-        // first update the subpools based on the new values
-        let basefee_ordering = self.update_basefee(info.pending_basefee, |_| {});
+    /// This will also apply updates to the pool based on the new base fee and blob fee.
+    ///
+    /// Returns the outcome containing any transactions that were promoted due to fee changes.
+    pub fn set_block_info(&mut self, info: BlockInfo) -> UpdateOutcome<T::Transaction> {
+        let mut outcome = UpdateOutcome::default();
+
+        // first update the subpools based on the new values, collecting promoted transactions
+        let basefee_ordering = self.update_basefee(info.pending_basefee, |tx| {
+            outcome.promoted.push(tx.clone());
+        });
         if let Some(blob_fee) = info.pending_blob_fee {
-            self.update_blob_fee(blob_fee, basefee_ordering, |_| {})
+            self.update_blob_fee(blob_fee, basefee_ordering, |tx| {
+                outcome.promoted.push(tx.clone());
+            })
         }
         // then update tracked values
         self.all_transactions.set_block_info(info);
+
+        outcome
     }
 
     /// Returns an iterator that yields transactions that are ready to be included in the block with
@@ -480,19 +494,12 @@ impl<T: TransactionOrdering> TxPool<T> {
         &self,
         sender: SenderId,
     ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
-        self.pending_transactions_iter().filter(|tx| tx.sender_id() == sender).collect()
+        self.pending_pool.txs_by_sender(sender)
     }
 
     /// Returns all transactions from parked pools
     pub(crate) fn queued_transactions(&self) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
         self.basefee_pool.all().chain(self.queued_pool.all()).collect()
-    }
-
-    /// Returns an iterator over all transactions from parked pools
-    pub(crate) fn queued_transactions_iter(
-        &self,
-    ) -> impl Iterator<Item = Arc<ValidPoolTransaction<T::Transaction>>> + '_ {
-        self.basefee_pool.all().chain(self.queued_pool.all())
     }
 
     /// Returns the number of transactions in parked pools
@@ -513,7 +520,9 @@ impl<T: TransactionOrdering> TxPool<T> {
         &self,
         sender: SenderId,
     ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
-        self.queued_transactions_iter().filter(|tx| tx.sender_id() == sender).collect()
+        let mut txs = self.basefee_pool.txs_by_sender(sender);
+        txs.extend(self.queued_pool.txs_by_sender(sender));
+        txs
     }
 
     /// Returns `true` if the transaction with the given hash is already included in this pool.
@@ -700,6 +709,7 @@ impl<T: TransactionOrdering> TxPool<T> {
 
     /// Update sub-pools size metrics.
     pub(crate) fn update_size_metrics(&self) {
+        self.all_transactions.update_size_metrics();
         let stats = self.size();
         self.metrics.pending_pool_transactions.set(stats.pending as f64);
         self.metrics.pending_pool_size_bytes.set(stats.pending_size as f64);
@@ -714,30 +724,13 @@ impl<T: TransactionOrdering> TxPool<T> {
 
     /// Updates transaction type metrics for the entire pool.
     pub(crate) fn update_transaction_type_metrics(&self) {
-        let mut legacy_count = 0;
-        let mut eip2930_count = 0;
-        let mut eip1559_count = 0;
-        let mut eip4844_count = 0;
-        let mut eip7702_count = 0;
-        let mut other_count = 0;
-
-        for tx in self.all_transactions.transactions_iter() {
-            match tx.transaction.ty() {
-                LEGACY_TX_TYPE_ID => legacy_count += 1,
-                EIP2930_TX_TYPE_ID => eip2930_count += 1,
-                EIP1559_TX_TYPE_ID => eip1559_count += 1,
-                EIP4844_TX_TYPE_ID => eip4844_count += 1,
-                EIP7702_TX_TYPE_ID => eip7702_count += 1,
-                _ => other_count += 1,
-            }
-        }
-
-        self.metrics.total_legacy_transactions.set(legacy_count as f64);
-        self.metrics.total_eip2930_transactions.set(eip2930_count as f64);
-        self.metrics.total_eip1559_transactions.set(eip1559_count as f64);
-        self.metrics.total_eip4844_transactions.set(eip4844_count as f64);
-        self.metrics.total_eip7702_transactions.set(eip7702_count as f64);
-        self.metrics.total_other_transactions.set(other_count as f64);
+        let counts = &self.all_transactions.tx_type_counts;
+        self.metrics.total_legacy_transactions.set(counts.legacy as f64);
+        self.metrics.total_eip2930_transactions.set(counts.eip2930 as f64);
+        self.metrics.total_eip1559_transactions.set(counts.eip1559 as f64);
+        self.metrics.total_eip4844_transactions.set(counts.eip4844 as f64);
+        self.metrics.total_eip7702_transactions.set(counts.eip7702 as f64);
+        self.metrics.total_other_transactions.set(counts.other as f64);
     }
 
     pub(crate) fn add_transaction(
@@ -761,12 +754,41 @@ impl<T: TransactionOrdering> TxPool<T> {
             .update(on_chain_nonce, on_chain_balance);
 
         match self.all_transactions.insert_tx(tx, on_chain_balance, on_chain_nonce) {
-            Ok(InsertOk { transaction, move_to, replaced_tx, updates, state }) => {
-                // replace the new tx and remove the replaced in the subpool(s)
-                self.add_new_transaction(transaction.clone(), replaced_tx.clone(), move_to);
-                // Update inserted transactions metric
+            Ok(InsertOk { transaction, move_to, replaced_tx, mut updates, state }) => {
+                // Interleave update processing and new-tx insertion so that live
+                // `BestTransactions` iterators always receive transactions in nonce order.
+                // Updates are already in nonce-ascending order, so we split them around
+                // the new transaction's nonce:
+                //  1. Promote lower-nonce txs first  (e.g. balance-unlock scenario)
+                //  2. Add the new transaction
+                //  3. Promote higher-nonce txs last   (e.g. gap-fill scenario)
+                let new_nonce = transaction.id().nonce;
+                let split = updates.iter().position(|u| u.id.nonce >= new_nonce);
+                let (promoted, discarded) = match split {
+                    // All updates are lower-nonce — promote them first, then add new tx
+                    None => {
+                        let UpdateOutcome { promoted, discarded } = self.process_updates(updates);
+                        self.add_new_transaction(transaction.clone(), replaced_tx.clone(), move_to);
+                        (promoted, discarded)
+                    }
+                    // All updates are higher-nonce — add new tx first, then promote
+                    Some(0) => {
+                        self.add_new_transaction(transaction.clone(), replaced_tx.clone(), move_to);
+                        let UpdateOutcome { promoted, discarded } = self.process_updates(updates);
+                        (promoted, discarded)
+                    }
+                    // Mixed — split and interleave
+                    Some(i) => {
+                        let after = updates.split_off(i);
+                        let mut outcome = self.process_updates(updates);
+                        self.add_new_transaction(transaction.clone(), replaced_tx.clone(), move_to);
+                        let after_outcome = self.process_updates(after);
+                        outcome.promoted.extend(after_outcome.promoted);
+                        outcome.discarded.extend(after_outcome.discarded);
+                        (outcome.promoted, outcome.discarded)
+                    }
+                };
                 self.metrics.inserted_transactions.increment(1);
-                let UpdateOutcome { promoted, discarded } = self.process_updates(updates);
 
                 let replaced = replaced_tx.map(|(tx, _)| tx);
 
@@ -788,9 +810,6 @@ impl<T: TransactionOrdering> TxPool<T> {
                         queued_reason,
                     }
                 };
-
-                // Update size metrics after adding and potentially moving transactions.
-                self.update_size_metrics();
 
                 Ok(res)
             }
@@ -917,8 +936,8 @@ impl<T: TransactionOrdering> TxPool<T> {
     ///    of the standard limit. This is due to the possibility of the account being sweeped by an
     ///    unrelated account.
     /// 2. In case the pool is tracking a pending / queued transaction from a specific account, at
-    ///    most one in-flight transaction is allowed; any additional delegated transactions from
-    ///    that account will be rejected.
+    ///    most the configured inflight delegation slot limit of in-flight transactions is allowed;
+    ///    any additional delegated transactions from that account will be rejected.
     fn validate_auth(
         &self,
         transaction: &ValidPoolTransaction<T::Transaction>,
@@ -930,8 +949,13 @@ impl<T: TransactionOrdering> TxPool<T> {
 
         if let Some(authority_list) = &transaction.authority_ids {
             for sender_id in authority_list {
-                // Ensure authority has at most 1 inflight transaction.
-                if self.all_transactions.txs_iter(*sender_id).nth(1).is_some() {
+                // Ensure authority does not exceed the configured inflight delegation slot limit.
+                if self
+                    .all_transactions
+                    .txs_iter(*sender_id)
+                    .nth(self.config.max_inflight_delegated_slot_limit)
+                    .is_some()
+                {
                     return Err(PoolError::new(
                         *transaction.hash(),
                         PoolErrorKind::InvalidTransaction(InvalidPoolTransactionError::Eip7702(
@@ -1353,7 +1377,7 @@ pub(crate) struct AllTransactions<T: PoolTransaction> {
     /// Max number of executable transaction slots guaranteed per account
     max_account_slots: usize,
     /// _All_ transactions identified by their hash.
-    by_hash: HashMap<TxHash, Arc<ValidPoolTransaction<T>>>,
+    by_hash: B256Map<Arc<ValidPoolTransaction<T>>>,
     /// _All_ transaction in the pool sorted by their sender and nonce pair.
     txs: BTreeMap<TransactionId, PoolInternalTransaction<T>>,
     /// Contains the currently known information about the senders.
@@ -1371,7 +1395,10 @@ pub(crate) struct AllTransactions<T: PoolTransaction> {
     /// How to handle [`TransactionOrigin::Local`](crate::TransactionOrigin) transactions.
     local_transactions_config: LocalTransactionConfig,
     /// All accounts with a pooled authorization
-    auths: FxHashMap<SenderId, HashSet<TxHash>>,
+    auths: FxHashMap<SenderId, B256Set>,
+    /// Number of transactions in the pool by transaction type, tracked incrementally so metrics
+    /// updates don't require iterating the entire pool.
+    tx_type_counts: TxTypeCounts,
     /// All Transactions metrics
     metrics: AllTransactionsMetrics,
 }
@@ -1710,6 +1737,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
         let tx = self.by_hash.remove(tx_hash)?;
         let internal = self.txs.remove(&tx.transaction_id)?;
         self.remove_auths(&internal);
+        self.tx_type_counts.dec(internal.transaction.transaction.ty());
         // decrement the counter for the sender.
         self.tx_decr(tx.sender_id());
         Some((tx, internal.subpool))
@@ -1725,6 +1753,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
         let internal = self.txs.remove(tx_id)?;
         let tx = self.by_hash.remove(internal.transaction.hash())?;
         self.remove_auths(&internal);
+        self.tx_type_counts.dec(internal.transaction.transaction.ty());
         // decrement the counter for the sender.
         self.tx_decr(tx.sender_id());
         Some((tx, internal.subpool))
@@ -1771,6 +1800,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
         // decrement the counter for the sender.
         self.tx_decr(internal.transaction.sender_id());
+        self.tx_type_counts.dec(internal.transaction.transaction.ty());
 
         let result =
             self.by_hash.remove(internal.transaction.hash()).map(|tx| (tx, internal.subpool));
@@ -2016,6 +2046,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             Entry::Vacant(entry) => {
                 // Insert the transaction in both maps
                 self.by_hash.insert(*pool_tx.transaction.hash(), pool_tx.transaction.clone());
+                self.tx_type_counts.inc(pool_tx.transaction.transaction.ty());
                 entry.insert(pool_tx);
             }
             Entry::Occupied(mut entry) => {
@@ -2032,7 +2063,9 @@ impl<T: PoolTransaction> AllTransactions<T> {
                 }
                 let new_hash = *pool_tx.transaction.hash();
                 let new_transaction = pool_tx.transaction.clone();
+                self.tx_type_counts.inc(pool_tx.transaction.transaction.ty());
                 let replaced = entry.insert(pool_tx);
+                self.tx_type_counts.dec(replaced.transaction.transaction.ty());
                 self.by_hash.remove(replaced.transaction.hash());
                 self.by_hash.insert(new_hash, new_transaction);
 
@@ -2122,8 +2155,6 @@ impl<T: PoolTransaction> AllTransactions<T> {
             self.tx_inc(inserted_tx_id.sender);
         }
 
-        self.update_size_metrics();
-
         Ok(InsertOk { transaction, move_to: state.into(), state, replaced_tx, updates })
     }
 
@@ -2171,8 +2202,47 @@ impl<T: PoolTransaction> Default for AllTransactions<T> {
             price_bumps: Default::default(),
             local_transactions_config: Default::default(),
             auths: Default::default(),
+            tx_type_counts: Default::default(),
             metrics: Default::default(),
         }
+    }
+}
+
+/// Number of transactions in the pool grouped by transaction type.
+///
+/// Maintained incrementally on insert/remove so that metrics updates don't require iterating
+/// all transactions.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TxTypeCounts {
+    legacy: u64,
+    eip2930: u64,
+    eip1559: u64,
+    eip4844: u64,
+    eip7702: u64,
+    other: u64,
+}
+
+impl TxTypeCounts {
+    /// Returns a mutable reference to the counter for the given transaction type.
+    const fn counter_mut(&mut self, tx_type: u8) -> &mut u64 {
+        match tx_type {
+            LEGACY_TX_TYPE_ID => &mut self.legacy,
+            EIP2930_TX_TYPE_ID => &mut self.eip2930,
+            EIP1559_TX_TYPE_ID => &mut self.eip1559,
+            EIP4844_TX_TYPE_ID => &mut self.eip4844,
+            EIP7702_TX_TYPE_ID => &mut self.eip7702,
+            _ => &mut self.other,
+        }
+    }
+
+    /// Increments the counter for the given transaction type.
+    const fn inc(&mut self, tx_type: u8) {
+        *self.counter_mut(tx_type) += 1;
+    }
+
+    /// Decrements the counter for the given transaction type.
+    const fn dec(&mut self, tx_type: u8) {
+        *self.counter_mut(tx_type) -= 1;
     }
 }
 
@@ -3067,6 +3137,35 @@ mod tests {
         let err = pool.insert_tx(replacement, on_chain_balance, on_chain_nonce).unwrap_err();
         assert!(matches!(err, InsertErr::Underpriced { .. }));
         assert!(pool.contains(first.hash()));
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn insert_replace_underpriced_rounds_up_minimum_bump() {
+        let on_chain_balance = U256::ZERO;
+        let on_chain_nonce = 0;
+        let mut f = MockTransactionFactory::default();
+        let mut pool = AllTransactions { minimal_protocol_basefee: 0, ..Default::default() };
+        let mut tx = MockTransaction::eip1559().inc_price().inc_limit();
+        tx.set_priority_fee(1);
+        tx.set_max_fee(1);
+
+        let first = f.validated(tx.clone());
+        let _ = pool.insert_tx(first.clone(), on_chain_balance, on_chain_nonce).unwrap();
+
+        let mut replacement = f.validated(tx.rng_hash().inc_price());
+        replacement.transaction.set_priority_fee(1);
+        replacement.transaction.set_max_fee(2);
+        let err =
+            pool.insert_tx(replacement.clone(), on_chain_balance, on_chain_nonce).unwrap_err();
+        assert!(matches!(err, InsertErr::Underpriced { .. }));
+        assert!(pool.contains(first.hash()));
+        assert_eq!(pool.len(), 1);
+
+        replacement.transaction.set_priority_fee(2);
+        replacement.transaction.set_max_fee(2);
+        let replaced = pool.insert_tx(replacement, on_chain_balance, on_chain_nonce).unwrap();
+        assert!(replaced.replaced_tx.is_some());
         assert_eq!(pool.len(), 1);
     }
 
@@ -4560,5 +4659,161 @@ mod tests {
             tx_meta.state.contains(TxState::ENOUGH_FEE_CAP_BLOCK),
             "Non-4844 tx should gain ENOUGH_FEE_CAP_BLOCK bit after basefee decrease"
         );
+    }
+
+    /// Test for <https://github.com/paradigmxyz/reth/issues/17701>
+    ///
+    /// When a new transaction is added and its `updates` contain a same-sender transaction with
+    /// a lower nonce, the lower-nonce tx must be added to the pending subpool *before* the
+    /// higher-nonce tx. Otherwise, live `BestTransactions` iterators receive them out of order.
+    #[test]
+    fn best_transactions_nonce_order_on_balance_unlock() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let sender = Address::random();
+        let on_chain_balance = U256::from(10_000);
+
+        // tx0: nonce 0, cheap — will go straight to pending
+        let tx0 = MockTransaction::eip1559().with_sender(sender).set_gas_price(100).inc_limit();
+        // tx1: nonce 1, very expensive — cumulative cost (tx0 + tx1) will exceed balance
+        let tx1 = tx0.next().inc_limit().with_value(U256::from(on_chain_balance));
+        // tx2: nonce 2
+        let tx2 = tx1.next().inc_limit().with_value(U256::ZERO);
+
+        let v0 = f.validated(tx0);
+        let v1 = f.validated(tx1);
+        let v2 = f.validated(tx2);
+
+        // Add tx0 with limited balance — goes to pending (tx0 cost is small: 1 * 100 = 100)
+        pool.add_transaction(v0, on_chain_balance, 0, None).unwrap();
+
+        // Create a live BestTransactions iterator that will receive new pending txs
+        let mut best = pool.best_transactions();
+
+        // Drain tx0 from the iterator
+        let first = best.next().expect("should yield tx0");
+        assert_eq!(first.id().nonce, 0);
+
+        // Add tx1 with the same limited balance — cumulative cost exceeds balance, goes to
+        // queued
+        pool.add_transaction(v1, on_chain_balance, 0, None).unwrap();
+
+        // tx1 should be queued, nothing new in best
+        assert!(best.next().is_none(), "tx1 should be queued, not pending");
+
+        // Now add tx2 with U256::MAX balance — tx2 goes to pending AND tx1 gets promoted.
+        // The bug: tx2 was added to pending *before* tx1, so BestTransactions yielded tx2
+        // first, violating nonce ordering.
+        pool.add_transaction(v2, U256::MAX, 0, None).unwrap();
+
+        let t1 = best.next().expect("should yield a transaction");
+        let t2 = best.next().expect("should yield a transaction");
+
+        // Correct order: tx1 (nonce 1) before tx2 (nonce 2)
+        assert_eq!(
+            t1.id().nonce,
+            1,
+            "first yielded tx should be nonce 1, got nonce {}",
+            t1.id().nonce
+        );
+        assert_eq!(
+            t2.id().nonce,
+            2,
+            "second yielded tx should be nonce 2, got nonce {}",
+            t2.id().nonce
+        );
+    }
+
+    /// Gap-fill scenario: inserting a low-nonce transaction promotes a queued higher-nonce
+    /// transaction. The new (lower-nonce) tx must appear before the promoted (higher-nonce)
+    /// tx in the `BestTransactions` iterator.
+    #[test]
+    fn best_transactions_nonce_order_on_gap_fill() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let sender = Address::random();
+        let balance = U256::MAX;
+
+        // tx0: nonce 0
+        let tx0 = MockTransaction::eip1559().with_sender(sender).set_gas_price(100).inc_limit();
+        // tx1: nonce 1
+        let tx1 = tx0.next().inc_limit();
+
+        let v0 = f.validated(tx0);
+        let v1 = f.validated(tx1);
+
+        // Add tx1 first — goes to queued because nonce 0 is missing (nonce gap)
+        pool.add_transaction(v1, balance, 0, None).unwrap();
+
+        // Create a live BestTransactions iterator (currently empty — nothing pending)
+        let mut best = pool.best_transactions();
+        assert!(best.next().is_none(), "pool should have no pending txs yet");
+
+        // Add tx0 — fills the gap, tx1 gets promoted
+        pool.add_transaction(v0, balance, 0, None).unwrap();
+
+        let t0 = best.next().expect("should yield a transaction");
+        let t1 = best.next().expect("should yield a transaction");
+
+        assert_eq!(t0.id().nonce, 0, "first yielded tx should be nonce 0, got {}", t0.id().nonce);
+        assert_eq!(t1.id().nonce, 1, "second yielded tx should be nonce 1, got {}", t1.id().nonce);
+    }
+
+    /// Mixed scenario: inserting a mid-nonce transaction promotes both a lower-nonce tx
+    /// (via balance update) and a higher-nonce tx (via gap fill). All three must appear
+    /// in nonce order in `BestTransactions`.
+    #[test]
+    fn best_transactions_nonce_order_mixed_promotions() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let sender = Address::random();
+        let low_balance = U256::from(10_000);
+
+        // tx0: nonce 0, cheap
+        let tx0 = MockTransaction::eip1559().with_sender(sender).set_gas_price(100).inc_limit();
+        // tx1: nonce 1, very expensive — will exceed balance
+        let tx1 = tx0.next().inc_limit().with_value(U256::from(low_balance));
+        // tx2: nonce 2
+        let tx2 = tx1.next().inc_limit().with_value(U256::ZERO);
+        // tx3: nonce 3
+        let tx3 = tx2.next().inc_limit().with_value(U256::ZERO);
+
+        let v0 = f.validated(tx0);
+        let v1 = f.validated(tx1);
+        let v2 = f.validated(tx2);
+        let v3 = f.validated(tx3);
+
+        // Add tx0 — goes to pending
+        pool.add_transaction(v0, low_balance, 0, None).unwrap();
+
+        // Add tx1 — queued (cumulative cost exceeds balance)
+        pool.add_transaction(v1, low_balance, 0, None).unwrap();
+
+        // Add tx3 — queued (nonce gap: tx2 is missing)
+        pool.add_transaction(v3, low_balance, 0, None).unwrap();
+
+        let mut best = pool.best_transactions();
+
+        // Drain tx0
+        let first = best.next().expect("should yield tx0");
+        assert_eq!(first.id().nonce, 0);
+        assert!(best.next().is_none(), "only tx0 should be pending");
+
+        // Add tx2 with U256::MAX balance — this should:
+        //  - promote tx1 (lower-nonce, was queued due to balance)
+        //  - add tx2 itself to pending
+        //  - promote tx3 (higher-nonce, was queued due to nonce gap)
+        pool.add_transaction(v2, U256::MAX, 0, None).unwrap();
+
+        let t1 = best.next().expect("should yield nonce 1");
+        let t2 = best.next().expect("should yield nonce 2");
+        let t3 = best.next().expect("should yield nonce 3");
+
+        assert_eq!(t1.id().nonce, 1, "expected nonce 1, got {}", t1.id().nonce);
+        assert_eq!(t2.id().nonce, 2, "expected nonce 2, got {}", t2.id().nonce);
+        assert_eq!(t3.id().nonce, 3, "expected nonce 3, got {}", t3.id().nonce);
     }
 }

@@ -11,63 +11,48 @@
 //! 2. Prewarming tasks execute transactions in parallel using shared caches
 //! 3. When actual block execution happens, it benefits from the warmed cache
 
+use super::bal_prewarm_pool::BalPrewarmPool;
 use crate::tree::{
-    cached_state::{CachedStateProvider, SavedCache},
-    payload_processor::{
-        bal::{self, total_slots, BALSlotIter},
-        multiproof::{MultiProofMessage, VersionedMultiProofTargets},
-        PayloadExecutionCache,
+    payload_processor::multiproof::{
+        StateRootHashedUpdateStream, StateRootHintStream, StateRootStreams,
     },
     precompile_cache::{CachedPrecompile, PrecompileCacheMap},
-    ExecutionEnv, StateProviderBuilder,
+    CachedStateCacheMetrics, CachedStateMetrics, CachedStateProvider, ExecutionEnv,
+    PayloadExecutionCache, SavedCache, StateProviderBuilder,
 };
 use alloy_consensus::transaction::TxHashRef;
-use alloy_eip7928::BlockAccessList;
+use alloy_eip7928::bal::DecodedBal;
 use alloy_eips::eip4895::Withdrawal;
-use alloy_evm::Database;
-use alloy_primitives::{keccak256, map::B256Set, B256};
-use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
+use alloy_primitives::{keccak256, B256, U256};
 use metrics::{Counter, Gauge, Histogram};
+use rayon::prelude::*;
 use reth_evm::{execute::ExecutableTxFor, ConfigureEvm, Evm, EvmFor, RecoveredTx, SpecFor};
 use reth_metrics::Metrics;
-use reth_primitives_traits::NodePrimitives;
+use reth_primitives_traits::{Account, FastInstant as Instant, NodePrimitives};
 use reth_provider::{
-    AccountReader, BlockExecutionOutput, BlockReader, StateProvider, StateProviderFactory,
-    StateReader,
+    AccountReader, BlockExecutionOutput, BlockReader, StateProviderFactory, StateReader,
 };
-use reth_revm::{database::StateProviderDatabase, state::EvmState};
-use reth_tasks::Runtime;
-use reth_trie::MultiProofTargets;
-use std::{
-    ops::Range,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, channel, Receiver, Sender},
-        Arc,
-    },
-    time::Instant,
+use reth_revm::database::StateProviderDatabase;
+use reth_tasks::{pool::WorkerPool, Runtime};
+use reth_trie_common::MultiProofTargetsV2;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc::{self, channel, Receiver, Sender},
+    Arc,
 };
-use tracing::{debug, debug_span, instrument, trace, warn, Span};
+use tokio::sync::oneshot;
+use tracing::{debug, debug_span, instrument, trace, trace_span, warn, Span};
 
 /// Determines the prewarming mode: transaction-based, BAL-based, or skipped.
 #[derive(Debug)]
 pub enum PrewarmMode<Tx> {
-    /// Prewarm by executing transactions from a stream.
-    Transactions(Receiver<Tx>),
+    /// Prewarm by executing transactions from a stream, each paired with its block index.
+    Transactions(Receiver<(usize, Tx)>),
     /// Prewarm by prefetching slots from a Block Access List.
-    BlockAccessList(Arc<BlockAccessList>),
+    BlockAccessList(Arc<DecodedBal>),
     /// Transaction prewarming is skipped (e.g. small blocks where the overhead exceeds the
     /// benefit). No workers are spawned.
     Skipped,
-}
-
-/// A wrapper for transactions that includes their index in the block.
-#[derive(Clone)]
-struct IndexedTransaction<Tx> {
-    /// The transaction index in the block.
-    index: usize,
-    /// The wrapped transaction.
-    tx: Tx,
 }
 
 /// A task that is responsible for caching and prewarming the cache by executing transactions
@@ -86,10 +71,8 @@ where
     execution_cache: PayloadExecutionCache,
     /// Context provided to execution tasks
     ctx: PrewarmContext<N, P, Evm>,
-    /// How many transactions should be executed in parallel
-    max_concurrency: usize,
-    /// Sender to emit evm state outcome messages, if any.
-    to_multi_proof: Option<CrossbeamSender<MultiProofMessage>>,
+    /// State-root streams used for prewarm hints and BAL-derived authoritative updates.
+    state_root_streams: StateRootStreams,
     /// Receiver for events produced by tx execution
     actions_rx: Receiver<PrewarmTaskEvent<N::Receipt>>,
     /// Parent span for tracing
@@ -107,14 +90,13 @@ where
         executor: Runtime,
         execution_cache: PayloadExecutionCache,
         ctx: PrewarmContext<N, P, Evm>,
-        to_multi_proof: Option<CrossbeamSender<MultiProofMessage>>,
-        max_concurrency: usize,
+        state_root_streams: StateRootStreams,
     ) -> (Self, Sender<PrewarmTaskEvent<N::Receipt>>) {
         let (actions_tx, actions_rx) = channel();
 
         trace!(
             target: "engine::tree::payload_processor::prewarm",
-            max_concurrency,
+            prewarming_threads = executor.prewarming_pool().current_num_threads(),
             transaction_count = ctx.env.transaction_count,
             "Initialized prewarm task"
         );
@@ -124,8 +106,7 @@ where
                 executor,
                 execution_cache,
                 ctx,
-                max_concurrency,
-                to_multi_proof,
+                state_root_streams,
                 actions_rx,
                 parent_span: Span::current(),
             },
@@ -133,81 +114,148 @@ where
         )
     }
 
-    /// Spawns all pending transactions as blocking tasks by first chunking them.
+    /// Streams pending transactions and executes them in parallel on the prewarming pool.
     ///
-    /// For Optimism chains, special handling is applied to the first transaction if it's a
-    /// deposit transaction (type 0x7E/126) which sets critical metadata that affects all
-    /// subsequent transactions in the block.
-    fn spawn_all<Tx>(
+    /// Kicks off EVM init on every pool thread, then uses `in_place_scope` to dispatch
+    /// transactions as they arrive and wait for all spawned tasks to complete before
+    /// clearing per-thread state. Workers that start via work-stealing lazily initialise
+    /// their EVM state on first access via [`get_or_init`](reth_tasks::pool::Worker::get_or_init).
+    fn spawn_txs_prewarm<Tx>(
         &self,
-        pending: mpsc::Receiver<Tx>,
+        pending: mpsc::Receiver<(usize, Tx)>,
         actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>,
-        to_multi_proof: Option<CrossbeamSender<MultiProofMessage>>,
+        state_root_hint_stream: Option<StateRootHintStream>,
     ) where
-        Tx: ExecutableTxFor<Evm> + Clone + Send + 'static,
+        Tx: ExecutableTxFor<Evm> + Send + 'static,
     {
         let executor = self.executor.clone();
         let ctx = self.ctx.clone();
-        let max_concurrency = self.max_concurrency;
         let span = Span::current();
 
-        self.executor.spawn_blocking(move || {
-            let _enter = debug_span!(target: "engine::tree::payload_processor::prewarm", parent: span, "spawn_all").entered();
+        self.executor.spawn_blocking_named("prewarm-txs", move || {
+            let _enter = debug_span!(
+                target: "engine::tree::payload_processor::prewarm",
+                parent: &span,
+                "prewarm_txs"
+            )
+            .entered();
 
-            let (done_tx, done_rx) = mpsc::channel();
+            let ctx = &ctx;
+            let pool = executor.prewarming_pool();
 
-            // When transaction_count is 0, it means the count is unknown. In this case, spawn
-            // max workers to handle potentially many transactions in parallel rather
-            // than bottlenecking on a single worker.
-            let transaction_count = ctx.env.transaction_count;
-            let workers_needed = if transaction_count == 0 {
-                max_concurrency
-            } else {
-                transaction_count.min(max_concurrency)
-            };
+            let mut tx_count = 0usize;
+            let state_root_hint_stream = state_root_hint_stream.as_ref();
+            pool.in_place_scope(|s| {
+                s.spawn(|_| {
+                    pool.init::<PrewarmEvmState<Evm>>(|_| ctx.evm_for_ctx());
+                });
 
-            // Spawn workers
-            let tx_sender = ctx.clone().spawn_workers(workers_needed, &executor,  to_multi_proof.clone(), done_tx.clone());
+                while let Ok((index, tx)) = pending.recv() {
+                    if ctx.should_stop() {
+                        trace!(
+                            target: "engine::tree::payload_processor::prewarm",
+                            "Termination requested, stopping transaction distribution"
+                        );
+                        break;
+                    }
 
-            // Distribute transactions to workers
-            let mut tx_index = 0usize;
-            while let Ok(tx) = pending.recv() {
-                // Stop distributing if termination was requested
-                if ctx.terminate_execution.load(Ordering::Relaxed) {
-                    trace!(
-                        target: "engine::tree::payload_processor::prewarm",
-                        "Termination requested, stopping transaction distribution"
-                    );
-                    break;
+                    // skip transactions already executed by the main loop
+                    if index < ctx.executed_tx_index.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    tx_count += 1;
+                    let parent_span = Span::current();
+                    s.spawn(move |_| {
+                        let _enter = trace_span!(
+                            target: "engine::tree::payload_processor::prewarm",
+                            parent: parent_span,
+                            "prewarm_tx",
+                            i = index,
+                        )
+                        .entered();
+                        Self::transact_worker(ctx, index, tx, state_root_hint_stream);
+                    });
                 }
 
-                let indexed_tx = IndexedTransaction { index: tx_index, tx };
+                // Send withdrawal prefetch targets after all transactions dispatched
+                if let Some(state_root_hint_stream) = state_root_hint_stream &&
+                    let Some(withdrawals) = &ctx.env.withdrawals &&
+                    !withdrawals.is_empty()
+                {
+                    let targets = multiproof_targets_from_withdrawals(withdrawals);
+                    state_root_hint_stream.on_access_hint(targets.into());
+                }
+            });
 
-                // Send transaction to the workers
-                // Ignore send errors: workers listen to terminate_execution and may
-                // exit early when signaled.
-                let _ = tx_sender.send(indexed_tx);
-
-                tx_index += 1;
-            }
-
-            // Send withdrawal prefetch targets after all transactions have been distributed
-            if let Some(to_multi_proof) = to_multi_proof
-                && let Some(withdrawals) = &ctx.env.withdrawals
-                && !withdrawals.is_empty()
-            {
-                let targets =
-                    multiproof_targets_from_withdrawals(withdrawals, ctx.v2_proofs_enabled);
-                let _ = to_multi_proof.send(MultiProofMessage::PrefetchProofs(targets));
-            }
-
-            // drop sender and wait for all tasks to finish
-            drop(done_tx);
-            drop(tx_sender);
-            while done_rx.recv().is_ok() {}
+            // All tasks are done — clear per-thread EVM state for the next block.
+            pool.clear();
 
             let _ = actions_tx
-                .send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: tx_index });
+                .send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: tx_count });
+        });
+    }
+
+    /// Executes a single prewarm transaction on the current pool thread's EVM.
+    ///
+    /// Lazily initialises per-thread [`PrewarmEvmState`] via
+    /// [`get_or_init`](reth_tasks::pool::Worker::get_or_init) on first access.
+    fn transact_worker<Tx>(
+        ctx: &PrewarmContext<N, P, Evm>,
+        index: usize,
+        tx: Tx,
+        state_root_hint_stream: Option<&StateRootHintStream>,
+    ) where
+        Tx: ExecutableTxFor<Evm>,
+    {
+        WorkerPool::with_worker_mut(|worker| {
+            let Some(evm) =
+                worker.get_or_init::<PrewarmEvmState<Evm>>(|| ctx.evm_for_ctx()).as_mut()
+            else {
+                return;
+            };
+
+            if ctx.should_stop() {
+                return;
+            }
+
+            // skip if main execution has already processed this transaction
+            if index < ctx.executed_tx_index.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let start = Instant::now();
+
+            let (tx_env, tx) = tx.into_parts();
+            let res = match evm.transact(tx_env) {
+                Ok(res) => res,
+                Err(err) => {
+                    trace!(
+                        target: "engine::tree::payload_processor::prewarm",
+                        %err,
+                        tx_hash=%tx.tx().tx_hash(),
+                        sender=%tx.signer(),
+                        "Error when executing prewarm transaction",
+                    );
+                    ctx.metrics.transaction_errors.increment(1);
+                    return;
+                }
+            };
+            ctx.metrics.execution_duration.record(start.elapsed());
+
+            if ctx.should_stop() {
+                return;
+            }
+
+            if index > 0 {
+                let (targets, storage_targets) = MultiProofTargetsV2::from_state(res.state);
+                ctx.metrics.prefetch_storage_targets.record(storage_targets as f64);
+                if let Some(state_root_hint_stream) = state_root_hint_stream {
+                    state_root_hint_stream.on_access_hint(targets.into());
+                }
+            }
+
+            ctx.metrics.total_runtime.record(start.elapsed());
         });
     }
 
@@ -218,7 +266,7 @@ where
     ///
     /// Saves the warmed caches back into the shared slot after prewarming completes.
     ///
-    /// This consumes the `SavedCache` held by the task, which releases its usage guard and allows
+    /// This consumes the `SavedCache` held by the task, which releases its cache handle and allows
     /// the new, warmed cache to be inserted.
     ///
     /// This method is called from `run()` only after all execution tasks are complete.
@@ -230,19 +278,20 @@ where
     ) {
         let start = Instant::now();
 
-        let Self { execution_cache, ctx: PrewarmContext { env, metrics, saved_cache, .. }, .. } =
-            self;
+        let Self {
+            execution_cache,
+            ctx: PrewarmContext { env, metrics, cache_state_metrics, saved_cache, .. },
+            ..
+        } = self;
         let hash = env.hash;
 
         if let Some(saved_cache) = saved_cache {
             debug!(target: "engine::caching", parent_hash=?hash, "Updating execution cache");
-            // Perform all cache operations atomically under the lock
             execution_cache.update_with_guard(|cached| {
-                // consumes the `SavedCache` held by the prewarming task, which releases its usage
-                // guard
-                let (caches, cache_metrics, disable_cache_metrics) = saved_cache.split();
-                let new_cache = SavedCache::new(hash, caches, cache_metrics)
-                    .with_disable_cache_metrics(disable_cache_metrics);
+                // consumes the `SavedCache` held by the prewarming task, which releases its cache
+                // handle
+                let caches = saved_cache.cache().clone();
+                let new_cache = SavedCache::new(hash, caches);
 
                 // Insert state into cache while holding the lock
                 // Access the BundleState through the shared ExecutionOutcome
@@ -253,7 +302,7 @@ where
                     return;
                 }
 
-                new_cache.update_metrics();
+                new_cache.update_metrics(cache_state_metrics.as_ref());
 
                 if valid_block_rx.recv().is_ok() {
                     // Replace the shared cache with the new one; the previous cache (if any) is
@@ -274,126 +323,118 @@ where
         }
     }
 
-    /// Runs BAL-based prewarming by spawning workers to prefetch storage slots.
+    /// Runs BAL-based prewarming and state-root streaming inline.
     ///
-    /// Divides the total slots across `max_concurrency` workers, each responsible for
-    /// prefetching a range of slots from the BAL.
+    /// Spawns two halves concurrently on separate pools, then waits for both to complete:
+    /// 1. Hashed state streaming on the BAL streaming pool so storage updates can reach the
+    ///    state-root job before account reads finish.
+    /// 2. Storage prefetch on the prewarming pool to populate the execution cache, unless BAL batch
+    ///    I/O is disabled.
     #[instrument(level = "debug", target = "engine::tree::payload_processor::prewarm", skip_all)]
     fn run_bal_prewarm(
         &self,
-        bal: Arc<BlockAccessList>,
+        decoded_bal: Arc<DecodedBal>,
         actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>,
     ) {
-        // Only prefetch if we have a cache to populate
-        if self.ctx.saved_cache.is_none() {
-            trace!(
-                target: "engine::tree::payload_processor::prewarm",
-                "Skipping BAL prewarm - no cache available"
-            );
-            self.send_bal_hashed_state(&bal);
+        let bal = decoded_bal.as_bal();
+        if bal.is_empty() {
+            if let Some(hashed_update_stream) = self.state_root_streams.hashed_update_stream() {
+                hashed_update_stream.on_updates_finished();
+            }
             let _ =
                 actions_tx.send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: 0 });
             return;
         }
 
-        let total_slots = total_slots(&bal);
-
         trace!(
             target: "engine::tree::payload_processor::prewarm",
-            total_slots,
-            max_concurrency = self.max_concurrency,
+            accounts = bal.len(),
             "Starting BAL prewarm"
         );
 
-        if total_slots == 0 {
-            self.send_bal_hashed_state(&bal);
-            let _ =
-                actions_tx.send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: 0 });
-            return;
+        let ctx = self.ctx.clone();
+        let hashed_update_stream = self.state_root_streams.hashed_update_stream();
+        let executor = self.executor.clone();
+        let parent_span = Span::current();
+        let stream_parent_span = parent_span;
+        let prefetch_bal = Arc::clone(&decoded_bal);
+        let stream_bal = Arc::clone(&decoded_bal);
+        let (stream_tx, stream_rx) = oneshot::channel();
+
+        if let Some(hashed_update_stream) = hashed_update_stream {
+            let ctx = ctx.clone();
+            executor.bal_streaming_pool().spawn(move || {
+                let branch_span = debug_span!(
+                    target: "engine::tree::payload_processor::prewarm",
+                    parent: &stream_parent_span,
+                    "bal_hashed_state_stream",
+                    bal_accounts = stream_bal.as_bal().len(),
+                );
+                let parent_span = branch_span.clone();
+                let _span = branch_span.entered();
+
+                stream_bal.as_bal().par_iter().for_each(|account_changes| {
+                    WorkerPool::with_worker_mut(|worker| {
+                        let provider =
+                            worker.get_or_init::<Option<Box<dyn AccountReader>>>(|| None);
+                        ctx.send_bal_hashed_state(
+                            &parent_span,
+                            provider,
+                            account_changes,
+                            &hashed_update_stream,
+                        );
+                    });
+                });
+
+                hashed_update_stream.on_updates_finished();
+                let _ = stream_tx.send(());
+            });
+        } else {
+            let _ = stream_tx.send(());
         }
 
-        let (done_tx, done_rx) = mpsc::channel();
+        if let Some(saved_cache) = ctx.saved_cache &&
+            !ctx.disable_bal_batch_io &&
+            let Some(pool) = ctx.bal_prewarm_pool.as_ref()
+        {
+            // If
+            //
+            // - BAL path is enabled (and so bal_prewarm_pool is present),
+            // - dispatch_bal_batch_io is false
+            // - execution cache is not disabled
+            //
+            // we launch prewarming sequence of the BAL read set here. The BAL read-set consists
+            // of the accounts, their code if present, and declared storages (both storage_reads
+            // and storage_changes).
+            //
+            // This runs side-by-side with the parallel transaction execution reducing the time it
+            // spends blocking on the data.
+            let caches = saved_cache.cache().clone();
+            let provider_builder = ctx.provider.clone();
+            let build = Arc::new(move || provider_builder.build());
 
-        // Calculate number of workers needed (at most max_concurrency)
-        let workers_needed = total_slots.min(self.max_concurrency);
-
-        // Calculate slots per worker
-        let slots_per_worker = total_slots / workers_needed;
-        let remainder = total_slots % workers_needed;
-
-        // Spawn workers with their assigned ranges
-        for i in 0..workers_needed {
-            let start = i * slots_per_worker + i.min(remainder);
-            let extra = if i < remainder { 1 } else { 0 };
-            let end = start + slots_per_worker + extra;
-
-            self.ctx.spawn_bal_worker(
-                i,
-                &self.executor,
-                Arc::clone(&bal),
-                start..end,
-                done_tx.clone(),
-            );
+            pool.begin_block(build, caches);
+            for account in prefetch_bal.as_bal() {
+                pool.warm_account(account.address);
+                for change in &account.storage_changes {
+                    pool.warm_storage(account.address, change.slot.into());
+                }
+                for &slot in &account.storage_reads {
+                    pool.warm_storage(account.address, slot.into());
+                }
+            }
+            pool.end_block();
         }
 
-        // Drop our handle to done_tx so we can detect completion
-        drop(done_tx);
+        stream_rx
+            .blocking_recv()
+            .expect("BAL hashed-state streaming task dropped without signaling completion");
 
-        // Wait for all workers to complete
-        let mut completed_workers = 0;
-        while done_rx.recv().is_ok() {
-            completed_workers += 1;
-        }
+        // Drop the per-thread providers
+        executor.bal_streaming_pool().clear();
+        executor.prewarming_pool().clear();
 
-        trace!(
-            target: "engine::tree::payload_processor::prewarm",
-            completed_workers,
-            "All BAL prewarm workers completed"
-        );
-
-        // Convert BAL to HashedPostState and send to multiproof task
-        self.send_bal_hashed_state(&bal);
-
-        // Signal that execution has finished
         let _ = actions_tx.send(PrewarmTaskEvent::FinishedTxExecution { executed_transactions: 0 });
-    }
-
-    /// Converts the BAL to [`HashedPostState`](reth_trie::HashedPostState) and sends it to the
-    /// multiproof task.
-    fn send_bal_hashed_state(&self, bal: &BlockAccessList) {
-        let Some(to_multi_proof) = &self.to_multi_proof else { return };
-
-        let provider = match self.ctx.provider.build() {
-            Ok(provider) => provider,
-            Err(err) => {
-                warn!(
-                    target: "engine::tree::payload_processor::prewarm",
-                    ?err,
-                    "Failed to build provider for BAL hashed state conversion"
-                );
-                return;
-            }
-        };
-
-        match bal::bal_to_hashed_post_state(bal, &provider) {
-            Ok(hashed_state) => {
-                debug!(
-                    target: "engine::tree::payload_processor::prewarm",
-                    accounts = hashed_state.accounts.len(),
-                    storages = hashed_state.storages.len(),
-                    "Converted BAL to hashed post state"
-                );
-                let _ = to_multi_proof.send(MultiProofMessage::HashedStateUpdate(hashed_state));
-                let _ = to_multi_proof.send(MultiProofMessage::FinishedStateUpdates);
-            }
-            Err(err) => {
-                warn!(
-                    target: "engine::tree::payload_processor::prewarm",
-                    ?err,
-                    "Failed to convert BAL to hashed state"
-                );
-            }
-        }
     }
 
     /// Executes the task.
@@ -409,12 +450,12 @@ where
     )]
     pub fn run<Tx>(self, mode: PrewarmMode<Tx>, actions_tx: Sender<PrewarmTaskEvent<N::Receipt>>)
     where
-        Tx: ExecutableTxFor<Evm> + Clone + Send + 'static,
+        Tx: ExecutableTxFor<Evm> + Send + 'static,
     {
         // Spawn execution tasks based on mode
         match mode {
             PrewarmMode::Transactions(pending) => {
-                self.spawn_all(pending, actions_tx, self.to_multi_proof.clone());
+                self.spawn_txs_prewarm(pending, actions_tx, self.state_root_streams.hint_stream());
             }
             PrewarmMode::BlockAccessList(bal) => {
                 self.run_bal_prewarm(bal, actions_tx);
@@ -432,7 +473,7 @@ where
                 PrewarmTaskEvent::TerminateTransactionExecution => {
                     // stop tx processing
                     debug!(target: "engine::tree::prewarm", "Terminating prewarm execution");
-                    self.ctx.terminate_execution.store(true, Ordering::Relaxed);
+                    self.ctx.stop();
                 }
                 PrewarmTaskEvent::Terminate { execution_outcome, valid_block_rx } => {
                     trace!(target: "engine::tree::payload_processor::prewarm", "Received termination signal");
@@ -483,17 +524,37 @@ where
     pub saved_cache: Option<SavedCache>,
     /// Provider to obtain the state
     pub provider: StateProviderBuilder<N, P>,
+    /// Dedicated blocking pool for warming the BAL read-set. `Some` only on the BAL parallel
+    /// execution path; the pool is owned by the [`PayloadProcessor`](super::PayloadProcessor).
+    pub(crate) bal_prewarm_pool: Option<Arc<BalPrewarmPool>>,
     /// The metrics for the prewarm task.
     pub metrics: PrewarmMetrics,
+    /// Metrics for the execution cache.
+    /// Metrics for the execution cache. `None` disables metrics recording.
+    pub cache_metrics: Option<CachedStateMetrics>,
+    /// Metrics for shared execution cache state. `None` disables metrics recording.
+    pub cache_state_metrics: Option<CachedStateCacheMetrics>,
     /// An atomic bool that tells prewarm tasks to not start any more execution.
     pub terminate_execution: Arc<AtomicBool>,
+    /// Shared counter tracking the next transaction index to be executed by the main execution
+    /// loop. Prewarm workers skip transactions with `index < counter` since those have already
+    /// been executed.
+    pub executed_tx_index: Arc<AtomicUsize>,
     /// Whether the precompile cache is disabled.
     pub precompile_cache_disabled: bool,
     /// The precompile cache map.
     pub precompile_cache_map: PrecompileCacheMap<SpecFor<Evm>>,
-    /// Whether V2 proof calculation is enabled.
-    pub v2_proofs_enabled: bool,
+    /// Whether to disable BAL-driven parallel state root computation.
+    /// Only valid when BAL parallel execution is also disabled.
+    pub disable_bal_parallel_state_root: bool,
+    /// Whether BAL state prefetching during prewarm is disabled.
+    pub disable_bal_batch_io: bool,
 }
+
+/// Per-thread EVM state initialised by [`PrewarmContext::evm_for_ctx`] and stored in
+/// [`WorkerPool`] workers via [`Worker::get_or_init`](reth_tasks::pool::Worker::get_or_init).
+type PrewarmEvmState<Evm> =
+    Option<EvmFor<Evm, StateProviderDatabase<reth_provider::StateProviderBox>>>;
 
 impl<N, P, Evm> PrewarmContext<N, P, Evm>
 where
@@ -501,25 +562,10 @@ where
     P: BlockReader + StateProviderFactory + StateReader + Clone + 'static,
     Evm: ConfigureEvm<Primitives = N> + 'static,
 {
-    /// Splits this context into an evm, an evm config, metrics, the atomic bool for terminating
-    /// execution, and whether V2 proofs are enabled.
+    /// Creates a per-thread EVM for prewarming.
     #[instrument(level = "debug", target = "engine::tree::payload_processor::prewarm", skip_all)]
-    fn evm_for_ctx(
-        self,
-    ) -> Option<(EvmFor<Evm, impl Database>, PrewarmMetrics, Arc<AtomicBool>, bool)> {
-        let Self {
-            env,
-            evm_config,
-            saved_cache,
-            provider,
-            metrics,
-            terminate_execution,
-            precompile_cache_disabled,
-            precompile_cache_map,
-            v2_proofs_enabled,
-        } = self;
-
-        let mut state_provider = match provider.build() {
+    fn evm_for_ctx(&self) -> PrewarmEvmState<Evm> {
+        let mut state_provider = match self.provider.build() {
             Ok(provider) => provider,
             Err(err) => {
                 trace!(
@@ -532,16 +578,14 @@ where
         };
 
         // Use the caches to create a new provider with caching
-        if let Some(saved_cache) = saved_cache {
+        if let Some(saved_cache) = &self.saved_cache {
             let caches = saved_cache.cache().clone();
-            let cache_metrics = saved_cache.metrics().clone();
-            state_provider =
-                Box::new(CachedStateProvider::new_prewarm(state_provider, caches, cache_metrics));
+            state_provider = Box::new(CachedStateProvider::new_prewarm(state_provider, caches));
         }
 
         let state_provider = StateProviderDatabase::new(state_provider);
 
-        let mut evm_env = env.evm_env;
+        let mut evm_env = self.env.evm_env.clone();
 
         // we must disable the nonce check so that we can execute the transaction even if the nonce
         // doesn't match what's on chain.
@@ -553,342 +597,251 @@ where
 
         // create a new executor and disable nonce checks in the env
         let spec_id = *evm_env.spec_id();
-        let mut evm = evm_config.evm_with_env(state_provider, evm_env);
+        let mut evm = self.evm_config.evm_with_env(state_provider, evm_env);
 
-        if !precompile_cache_disabled {
+        if !self.precompile_cache_disabled {
             // Only cache pure precompiles to avoid issues with stateful precompiles
-            evm.precompiles_mut().map_pure_precompiles(|address, precompile| {
+            evm.precompiles_mut().map_cacheable_precompiles(|address, precompile| {
                 CachedPrecompile::wrap(
                     precompile,
-                    precompile_cache_map.cache_for_address(*address),
+                    self.precompile_cache_map.cache_for_address(*address),
                     spec_id,
                     None, // No metrics for prewarm
                 )
             });
         }
 
-        Some((evm, metrics, terminate_execution, v2_proofs_enabled))
+        Some(evm)
     }
 
-    /// Accepts a [`CrossbeamReceiver`] of transactions and a handle to prewarm task. Executes
-    /// transactions and streams [`MultiProofMessage::PrefetchProofs`] messages for each
-    /// transaction.
-    ///
-    /// This function processes transactions sequentially from the receiver and emits outcome events
-    /// via the provided sender. Execution errors are logged and tracked but do not stop the batch
-    /// processing unless the task is explicitly cancelled.
-    ///
-    /// Note: There are no ordering guarantees; this does not reflect the state produced by
-    /// sequential execution.
-    #[instrument(level = "debug", target = "engine::tree::payload_processor::prewarm", skip_all)]
-    fn transact_batch<Tx>(
-        self,
-        txs: CrossbeamReceiver<IndexedTransaction<Tx>>,
-        to_multi_proof: Option<CrossbeamSender<MultiProofMessage>>,
-        done_tx: Sender<()>,
-    ) where
-        Tx: ExecutableTxFor<Evm>,
-    {
-        let Some((mut evm, metrics, terminate_execution, v2_proofs_enabled)) = self.evm_for_ctx()
-        else {
-            return
-        };
-
-        while let Ok(IndexedTransaction { index, tx }) = txs.recv() {
-            let _enter = debug_span!(
-                target: "engine::tree::payload_processor::prewarm",
-                "prewarm tx",
-                index,
-            )
-            .entered();
-
-            // create the tx env
-            let start = Instant::now();
-
-            // If the task was cancelled, stop execution, and exit.
-            if terminate_execution.load(Ordering::Relaxed) {
-                break
-            }
-
-            let (tx_env, tx) = tx.into_parts();
-            let res = match evm.transact(tx_env) {
-                Ok(res) => res,
-                Err(err) => {
-                    trace!(
-                        target: "engine::tree::payload_processor::prewarm",
-                        %err,
-                        tx_hash=%tx.tx().tx_hash(),
-                        sender=%tx.signer(),
-                        "Error when executing prewarm transaction",
-                    );
-                    // Track transaction execution errors
-                    metrics.transaction_errors.increment(1);
-                    // skip error because we can ignore these errors and continue with the next tx
-                    continue
-                }
-            };
-            metrics.execution_duration.record(start.elapsed());
-
-            // If the task was cancelled, stop execution, and exit.
-            if terminate_execution.load(Ordering::Relaxed) {
-                break
-            }
-
-            // Only send outcome for transactions after the first txn
-            // as the main execution will be just as fast
-            if index > 0 {
-                let (targets, storage_targets) =
-                    multiproof_targets_from_state(res.state, v2_proofs_enabled);
-                metrics.prefetch_storage_targets.record(storage_targets as f64);
-                if let Some(to_multi_proof) = &to_multi_proof {
-                    let _ = to_multi_proof.send(MultiProofMessage::PrefetchProofs(targets));
-                }
-            }
-
-            metrics.total_runtime.record(start.elapsed());
-        }
-
-        // send a message to the main task to flag that we're done
-        let _ = done_tx.send(());
+    /// Returns `true` if prewarming should stop.
+    #[inline]
+    pub fn should_stop(&self) -> bool {
+        self.terminate_execution.load(Ordering::Relaxed)
     }
 
-    /// Spawns worker tasks that pull transactions from a shared channel.
-    ///
-    /// Returns the sender for distributing transactions to workers.
-    fn spawn_workers<Tx>(
-        self,
-        workers_needed: usize,
-        task_executor: &Runtime,
-        to_multi_proof: Option<CrossbeamSender<MultiProofMessage>>,
-        done_tx: Sender<()>,
-    ) -> CrossbeamSender<IndexedTransaction<Tx>>
-    where
-        Tx: ExecutableTxFor<Evm> + Send + 'static,
-    {
-        let (tx_sender, tx_receiver) = crossbeam_channel::unbounded();
-
-        // Spawn workers that all pull from the shared receiver
-        let executor = task_executor.clone();
-        let span = Span::current();
-        task_executor.spawn_blocking(move || {
-            let _enter = span.entered();
-            for idx in 0..workers_needed {
-                let ctx = self.clone();
-                let to_multi_proof = to_multi_proof.clone();
-                let done_tx = done_tx.clone();
-                let rx = tx_receiver.clone();
-                let span = debug_span!(target: "engine::tree::payload_processor::prewarm", "prewarm worker", idx);
-                executor.spawn_blocking(move || {
-                    let _enter = span.entered();
-                    ctx.transact_batch(rx, to_multi_proof, done_tx);
-                });
-            }
-        });
-
-        tx_sender
+    /// Signals all prewarm tasks to stop execution.
+    #[inline]
+    pub fn stop(&self) {
+        self.terminate_execution.store(true, Ordering::Relaxed);
     }
 
-    /// Spawns a worker task for BAL slot prefetching.
+    /// Hashes and streams a single BAL account's state to the state-root job's hashed-update
+    /// stream.
     ///
-    /// The worker iterates over the specified range of slots in the BAL and ensures
-    /// each slot is loaded into the cache by accessing it through the state provider.
-    fn spawn_bal_worker(
+    /// For each changed account, storage slots are hashed and sent immediately, then the account
+    /// is sent as a separate update. The parent account is read only when the BAL did not provide
+    /// all account leaf fields needed for state-root computation.
+    ///
+    /// The `provider` is lazily initialized on first call and reused across accounts on the same
+    /// thread.
+    fn send_bal_hashed_state(
         &self,
-        idx: usize,
-        executor: &Runtime,
-        bal: Arc<BlockAccessList>,
-        range: Range<usize>,
-        done_tx: Sender<()>,
+        parent_span: &Span,
+        provider: &mut Option<Box<dyn AccountReader>>,
+        account_changes: &alloy_eip7928::AccountChanges,
+        hashed_update_stream: &StateRootHashedUpdateStream,
     ) {
-        let ctx = self.clone();
-        let span = debug_span!(
-            target: "engine::tree::payload_processor::prewarm",
-            "bal prewarm worker",
-            idx,
-            range_start = range.start,
-            range_end = range.end
-        );
+        if self.disable_bal_parallel_state_root {
+            return;
+        }
+        let address = account_changes.address;
+        let mut hashed_address = None;
+        let account_fields = BalAccountStateFields::from_changes(account_changes);
 
-        executor.spawn_blocking(move || {
-            let _enter = span.entered();
-            ctx.prefetch_bal_slots(bal, range, done_tx);
-        });
-    }
+        if !bal_account_changes_state_root(account_changes, account_fields) {
+            return;
+        }
 
-    /// Prefetches storage slots from a BAL range into the cache.
-    ///
-    /// This iterates through the specified range of slots and accesses them via the state
-    /// provider to populate the cache.
-    #[instrument(level = "debug", target = "engine::tree::payload_processor::prewarm", skip_all)]
-    fn prefetch_bal_slots(
-        self,
-        bal: Arc<BlockAccessList>,
-        range: Range<usize>,
-        done_tx: Sender<()>,
-    ) {
-        let Self { saved_cache, provider, metrics, .. } = self;
+        if !account_changes.storage_changes.is_empty() {
+            let hashed_address = *hashed_address.get_or_insert_with(|| keccak256(address));
+            let mut storage_map = reth_trie::HashedStorage::new(false);
 
-        // Build state provider
-        let state_provider = match provider.build() {
-            Ok(provider) => provider,
-            Err(err) => {
-                trace!(
-                    target: "engine::tree::payload_processor::prewarm",
-                    %err,
-                    "Failed to build state provider in BAL prewarm thread"
-                );
-                let _ = done_tx.send(());
-                return;
+            for slot_changes in &account_changes.storage_changes {
+                let hashed_slot = keccak256(slot_changes.slot.to_be_bytes::<32>());
+                if let Some(last_change) = slot_changes.changes.last() {
+                    storage_map.storage.insert(hashed_slot, last_change.new_value);
+                }
             }
+
+            let mut hashed_state = reth_trie::HashedPostState::default();
+            hashed_state.storages.insert(hashed_address, storage_map);
+            hashed_update_stream.on_hashed_state_update(hashed_state);
+        }
+
+        let existing_account = if account_fields.needs_parent_account() {
+            if provider.is_none() {
+                let _span = debug_span!(
+                    target: "engine::tree::payload_processor::prewarm",
+                    parent: parent_span,
+                    "bal_hashed_state_provider_init",
+                    has_saved_cache = !self.disable_bal_batch_io && self.saved_cache.is_some(),
+                )
+                .entered();
+
+                let inner = match self.provider.build() {
+                    Ok(p) => p,
+                    Err(err) => {
+                        warn!(
+                            target: "engine::tree::payload_processor::prewarm",
+                            ?err,
+                            "Failed to build provider for BAL account reads"
+                        );
+                        return;
+                    }
+                };
+                let boxed: Box<dyn AccountReader> =
+                    match (self.disable_bal_batch_io, &self.saved_cache) {
+                        (false, Some(saved)) => {
+                            let caches = saved.cache().clone();
+                            Box::new(CachedStateProvider::new_prewarm(inner, caches))
+                        }
+                        _ => Box::new(inner),
+                    };
+                *provider = Some(boxed);
+            }
+            let account_reader = provider.as_ref().expect("provider just initialized");
+            account_reader.basic_account(&address).ok().flatten()
+        } else {
+            None
         };
 
-        // Wrap with cache (guaranteed to be Some since run_bal_prewarm checks)
-        let saved_cache = saved_cache.expect("BAL prewarm should only run with cache");
-        let caches = saved_cache.cache().clone();
-        let cache_metrics = saved_cache.metrics().clone();
-        let state_provider = CachedStateProvider::new(state_provider, caches, cache_metrics);
+        let account = account_fields.into_account(existing_account);
 
-        let start = Instant::now();
+        let hashed_address = hashed_address.unwrap_or_else(|| keccak256(address));
+        let mut hashed_state = reth_trie::HashedPostState::default();
+        hashed_state.accounts.insert(hashed_address, Some(account));
 
-        // Track last seen address to avoid fetching the same account multiple times.
-        let mut last_address = None;
-
-        // Iterate through the assigned range of slots
-        for (address, slot) in BALSlotIter::new(&bal, range.clone()) {
-            // Fetch the account if this is a different address than the last one
-            if last_address != Some(address) {
-                let _ = state_provider.basic_account(&address);
-                last_address = Some(address);
-            }
-
-            // Access the slot to populate the cache
-            let _ = state_provider.storage(address, slot);
-        }
-
-        let elapsed = start.elapsed();
-
-        trace!(
-            target: "engine::tree::payload_processor::prewarm",
-            ?range,
-            elapsed_ms = elapsed.as_millis(),
-            "BAL prewarm worker completed"
-        );
-
-        // Signal completion
-        let _ = done_tx.send(());
-        metrics.bal_slot_iteration_duration.record(elapsed.as_secs_f64());
+        hashed_update_stream.on_hashed_state_update(hashed_state);
     }
 }
 
-/// Returns a set of [`VersionedMultiProofTargets`] and the total amount of storage targets, based
-/// on the given state.
-fn multiproof_targets_from_state(
-    state: EvmState,
-    v2_enabled: bool,
-) -> (VersionedMultiProofTargets, usize) {
-    if v2_enabled {
-        multiproof_targets_v2_from_state(state)
-    } else {
-        multiproof_targets_legacy_from_state(state)
-    }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BalAccountStateFields {
+    balance: Option<U256>,
+    nonce: Option<u64>,
+    code_hash: Option<B256>,
 }
 
-/// Returns legacy [`MultiProofTargets`] and the total amount of storage targets, based on the
-/// given state.
-fn multiproof_targets_legacy_from_state(state: EvmState) -> (VersionedMultiProofTargets, usize) {
-    let mut targets = MultiProofTargets::with_capacity(state.len());
-    let mut storage_targets = 0;
-    for (addr, account) in state {
-        // if the account was not touched, or if the account was selfdestructed, do not
-        // fetch proofs for it
-        //
-        // Since selfdestruct can only happen in the same transaction, we can skip
-        // prefetching proofs for selfdestructed accounts
-        //
-        // See: https://eips.ethereum.org/EIPS/eip-6780
-        if !account.is_touched() || account.is_selfdestructed() {
-            continue
-        }
-
-        let mut storage_set =
-            B256Set::with_capacity_and_hasher(account.storage.len(), Default::default());
-        for (key, slot) in account.storage {
-            // do nothing if unchanged
-            if !slot.is_changed() {
-                continue
-            }
-
-            storage_set.insert(keccak256(B256::new(key.to_be_bytes())));
-        }
-
-        storage_targets += storage_set.len();
-        targets.insert(keccak256(addr), storage_set);
-    }
-
-    (VersionedMultiProofTargets::Legacy(targets), storage_targets)
-}
-
-/// Returns V2 [`reth_trie_parallel::targets_v2::MultiProofTargetsV2`] and the total amount of
-/// storage targets, based on the given state.
-fn multiproof_targets_v2_from_state(state: EvmState) -> (VersionedMultiProofTargets, usize) {
-    use reth_trie::proof_v2;
-    use reth_trie_parallel::targets_v2::MultiProofTargetsV2;
-
-    let mut targets = MultiProofTargetsV2::default();
-    let mut storage_target_count = 0;
-    for (addr, account) in state {
-        // if the account was not touched, or if the account was selfdestructed, do not
-        // fetch proofs for it
-        //
-        // Since selfdestruct can only happen in the same transaction, we can skip
-        // prefetching proofs for selfdestructed accounts
-        //
-        // See: https://eips.ethereum.org/EIPS/eip-6780
-        if !account.is_touched() || account.is_selfdestructed() {
-            continue
-        }
-
-        let hashed_address = keccak256(addr);
-        targets.account_targets.push(hashed_address.into());
-
-        let mut storage_slots = Vec::with_capacity(account.storage.len());
-        for (key, slot) in account.storage {
-            // do nothing if unchanged
-            if !slot.is_changed() {
-                continue
-            }
-
-            let hashed_slot = keccak256(B256::new(key.to_be_bytes()));
-            storage_slots.push(proof_v2::Target::from(hashed_slot));
-        }
-
-        storage_target_count += storage_slots.len();
-        if !storage_slots.is_empty() {
-            targets.storage_targets.insert(hashed_address, storage_slots);
+impl BalAccountStateFields {
+    fn from_changes(account_changes: &alloy_eip7928::AccountChanges) -> Self {
+        Self {
+            balance: account_changes.balance_changes.last().map(|change| change.post_balance),
+            nonce: account_changes.nonce_changes.last().map(|change| change.new_nonce),
+            code_hash: account_changes.code_changes.last().map(|code_change| {
+                if code_change.new_code.is_empty() {
+                    alloy_consensus::constants::KECCAK_EMPTY
+                } else {
+                    keccak256(&code_change.new_code)
+                }
+            }),
         }
     }
 
-    (VersionedMultiProofTargets::V2(targets), storage_target_count)
+    const fn is_empty(self) -> bool {
+        self.balance.is_none() && self.nonce.is_none() && self.code_hash.is_none()
+    }
+
+    const fn needs_parent_account(self) -> bool {
+        self.balance.is_none() || self.nonce.is_none() || self.code_hash.is_none()
+    }
+
+    fn into_account(self, existing_account: Option<Account>) -> Account {
+        let existing_account = existing_account.as_ref();
+        Account {
+            balance: self.balance.unwrap_or_else(|| {
+                existing_account
+                    .map(|account| account.balance)
+                    .unwrap_or(alloy_primitives::U256::ZERO)
+            }),
+            nonce: self
+                .nonce
+                .unwrap_or_else(|| existing_account.map(|account| account.nonce).unwrap_or(0)),
+            bytecode_hash: self.code_hash.or_else(|| {
+                existing_account
+                    .and_then(|account| account.bytecode_hash)
+                    .or(Some(alloy_consensus::constants::KECCAK_EMPTY))
+            }),
+        }
+    }
 }
 
-/// Returns [`VersionedMultiProofTargets`] for withdrawal addresses.
+const fn bal_account_changes_state_root(
+    account_changes: &alloy_eip7928::AccountChanges,
+    account_fields: BalAccountStateFields,
+) -> bool {
+    !account_fields.is_empty() || !account_changes.storage_changes.is_empty()
+}
+
+/// Returns [`MultiProofTargetsV2`] for withdrawal addresses.
 ///
 /// Withdrawals only modify account balances (no storage), so the targets contain
 /// only account-level entries with empty storage sets.
-fn multiproof_targets_from_withdrawals(
-    withdrawals: &[Withdrawal],
-    v2_enabled: bool,
-) -> VersionedMultiProofTargets {
-    use reth_trie_parallel::targets_v2::MultiProofTargetsV2;
-    if v2_enabled {
-        VersionedMultiProofTargets::V2(MultiProofTargetsV2 {
-            account_targets: withdrawals.iter().map(|w| keccak256(w.address).into()).collect(),
-            ..Default::default()
-        })
-    } else {
-        VersionedMultiProofTargets::Legacy(
-            withdrawals.iter().map(|w| (keccak256(w.address), Default::default())).collect(),
-        )
+fn multiproof_targets_from_withdrawals(withdrawals: &[Withdrawal]) -> MultiProofTargetsV2 {
+    MultiProofTargetsV2 {
+        account_targets: withdrawals.iter().map(|w| keccak256(w.address).into()).collect(),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_eip7928::{
+        AccountChanges, BalanceChange, BlockAccessIndex, CodeChange, NonceChange, SlotChanges,
+        StorageChange,
+    };
+    use alloy_primitives::{address, bytes};
+
+    #[test]
+    fn bal_read_only_account_does_not_change_state_root() {
+        let changes = AccountChanges::new(address!("0000000000000000000000000000000000000001"))
+            .with_storage_read(U256::from(1));
+        let fields = BalAccountStateFields::from_changes(&changes);
+
+        assert!(fields.is_empty());
+        assert!(!bal_account_changes_state_root(&changes, fields));
+    }
+
+    #[test]
+    fn bal_account_with_all_leaf_fields_does_not_need_parent_account() {
+        let changes = AccountChanges::new(address!("0000000000000000000000000000000000000001"))
+            .with_balance_change(BalanceChange::new(BlockAccessIndex::new(1), U256::from(10)))
+            .with_nonce_change(NonceChange::new(BlockAccessIndex::new(1), 7))
+            .with_code_change(CodeChange::new(BlockAccessIndex::new(1), bytes!("6001600155")));
+        let fields = BalAccountStateFields::from_changes(&changes);
+
+        assert!(bal_account_changes_state_root(&changes, fields));
+        assert!(!fields.needs_parent_account());
+    }
+
+    #[test]
+    fn bal_storage_change_needs_parent_account_when_leaf_fields_missing() {
+        let changes = AccountChanges::new(address!("0000000000000000000000000000000000000001"))
+            .with_storage_change(SlotChanges::new(
+                U256::from(1),
+                vec![StorageChange::new(BlockAccessIndex::new(1), U256::from(2))],
+            ));
+        let fields = BalAccountStateFields::from_changes(&changes);
+
+        assert!(bal_account_changes_state_root(&changes, fields));
+        assert!(fields.needs_parent_account());
+    }
+
+    #[test]
+    fn bal_account_uses_existing_fields_only_when_missing() {
+        let changes = AccountChanges::new(address!("0000000000000000000000000000000000000001"))
+            .with_balance_change(BalanceChange::new(BlockAccessIndex::new(1), U256::from(10)));
+        let fields = BalAccountStateFields::from_changes(&changes);
+        let account = fields.into_account(Some(Account {
+            balance: U256::from(1),
+            nonce: 3,
+            bytecode_hash: Some(B256::repeat_byte(0xaa)),
+        }));
+
+        assert_eq!(account.balance, U256::from(10));
+        assert_eq!(account.nonce, 3);
+        assert_eq!(account.bytecode_hash, Some(B256::repeat_byte(0xaa)));
     }
 }
 

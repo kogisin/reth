@@ -204,14 +204,33 @@ where
     pub fn block_info(&self) -> BlockInfo {
         self.get_pool_data().block_info()
     }
-    /// Sets the currently tracked block
+    /// Sets the currently tracked block.
+    ///
+    /// This will also notify subscribers about any transactions that were promoted to the pending
+    /// pool due to fee changes.
     pub fn set_block_info(&self, info: BlockInfo) {
-        self.pool.write().set_block_info(info)
+        let outcome = self.pool.write().set_block_info(info);
+
+        // Notify subscribers about promoted transactions due to fee changes
+        self.notify_on_transaction_updates(outcome.promoted, outcome.discarded);
     }
 
-    /// Returns the internal [`SenderId`] for this address
+    /// Returns the internal [`SenderId`] for this address, allocating a new mapping when the
+    /// address is first observed.
+    ///
+    /// This must only be used on paths that intentionally begin tracking a sender, such as
+    /// transaction insertion. Read-only lookups should prefer [`Self::sender_id`] to avoid
+    /// growing the sender-id map for unknown addresses.
     pub fn get_sender_id(&self, addr: Address) -> SenderId {
         self.identifiers.write().sender_id_or_create(addr)
+    }
+
+    /// Returns the internal [`SenderId`] for this address if it is already tracked.
+    ///
+    /// Unlike [`Self::get_sender_id`], this never allocates a new sender mapping and is therefore
+    /// suitable for read-only queries or best-effort cleanup on unknown addresses.
+    pub fn sender_id(&self, addr: &Address) -> Option<SenderId> {
+        self.identifiers.read().sender_id(addr)
     }
 
     /// Returns the internal [`SenderId`]s for the given addresses.
@@ -364,8 +383,13 @@ where
         &self,
         max: usize,
     ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let mut out = Vec::new();
-        self.append_pooled_transactions_max(max, &mut out);
+        if max == 0 {
+            return Vec::new()
+        }
+
+        let pool = self.get_pool_data();
+        let mut out = Vec::with_capacity(max.min(pool.all().len()));
+        out.extend(pool.all().transactions_iter().filter(|tx| tx.propagate).take(max).cloned());
         out
     }
 
@@ -440,13 +464,13 @@ where
         if max == 0 {
             return Vec::new();
         }
-        self.get_pool_data()
-            .all()
-            .transactions_iter()
-            .filter(|tx| tx.propagate)
-            .take(max)
-            .map(|tx| *tx.hash())
-            .collect()
+
+        let pool = self.get_pool_data();
+        let mut out = Vec::with_capacity(max.min(pool.all().len()));
+        out.extend(
+            pool.all().transactions_iter().filter(|tx| tx.propagate).take(max).map(|tx| *tx.hash()),
+        );
+        out
     }
 
     /// Converts the internally tracked transaction to the pooled format.
@@ -672,7 +696,9 @@ where
 
             // Enforce the pool size limits if at least one transaction was added successfully
             let discarded = if results.iter().any(Result::is_ok) {
-                pool.discard_worst()
+                let discarded = pool.discard_worst();
+                pool.update_size_metrics();
+                discarded
             } else {
                 Default::default()
             };
@@ -886,7 +912,6 @@ where
     /// [`TransactionEvents`] receivers when manually implementing the
     /// [`TransactionPool`](crate::TransactionPool) trait for a custom pool implementation
     /// [`TransactionPool::transaction_event_listener`](crate::TransactionPool).
-    #[allow(clippy::type_complexity)]
     pub fn notify_on_transaction_updates(
         &self,
         promoted: Vec<Arc<ValidPoolTransaction<T::Transaction>>>,
@@ -1072,7 +1097,7 @@ where
         &self,
         sender: Address,
     ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let sender_id = self.get_sender_id(sender);
+        let Some(sender_id) = self.sender_id(&sender) else { return Vec::new() };
         let removed = self.pool.write().remove_transactions_by_sender(sender_id);
 
         self.with_event_listener(|listener| listener.discarded_many(&removed));
@@ -1095,7 +1120,7 @@ where
         self.pool.write().prune_transactions(hashes)
     }
 
-    /// Removes and returns all transactions that are present in the pool.
+    /// Retains only transactions that are not present in the pool.
     pub fn retain_unknown<A>(&self, announcement: &mut A)
     where
         A: HandleMempoolData,
@@ -1105,6 +1130,18 @@ where
         }
         let pool = self.get_pool_data();
         announcement.retain_by_hash(|tx| !pool.contains(tx))
+    }
+
+    /// Retains only transactions that are present in the pool.
+    pub fn retain_contains<A>(&self, announcement: &mut A)
+    where
+        A: HandleMempoolData,
+    {
+        if announcement.is_empty() {
+            return
+        }
+        let pool = self.get_pool_data();
+        announcement.retain_by_hash(|tx| pool.contains(tx))
     }
 
     /// Returns the transaction by hash.
@@ -1117,7 +1154,7 @@ where
         &self,
         sender: Address,
     ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let sender_id = self.get_sender_id(sender);
+        let Some(sender_id) = self.sender_id(&sender) else { return Vec::new() };
         self.get_pool_data().get_transactions_by_sender(sender_id)
     }
 
@@ -1127,7 +1164,7 @@ where
         sender: Address,
         nonce: u64,
     ) -> Option<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let sender_id = self.get_sender_id(sender);
+        let sender_id = self.sender_id(&sender)?;
         self.get_pool_data().get_pending_transaction_by_sender_and_nonce(sender_id, nonce)
     }
 
@@ -1136,7 +1173,7 @@ where
         &self,
         sender: Address,
     ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let sender_id = self.get_sender_id(sender);
+        let Some(sender_id) = self.sender_id(&sender) else { return Vec::new() };
         self.get_pool_data().queued_txs_by_sender(sender_id)
     }
 
@@ -1153,7 +1190,7 @@ where
         &self,
         sender: Address,
     ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let sender_id = self.get_sender_id(sender);
+        let Some(sender_id) = self.sender_id(&sender) else { return Vec::new() };
         self.get_pool_data().pending_txs_by_sender(sender_id)
     }
 
@@ -1162,7 +1199,7 @@ where
         &self,
         sender: Address,
     ) -> Option<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let sender_id = self.get_sender_id(sender);
+        let sender_id = self.sender_id(&sender)?;
         self.get_pool_data().get_highest_transaction_by_sender(sender_id)
     }
 
@@ -1172,7 +1209,7 @@ where
         sender: Address,
         on_chain_nonce: u64,
     ) -> Option<Arc<ValidPoolTransaction<T::Transaction>>> {
-        let sender_id = self.get_sender_id(sender);
+        let sender_id = self.sender_id(&sender)?;
         self.get_pool_data().get_highest_consecutive_transaction_by_sender(
             sender_id.into_transaction_id(on_chain_nonce),
         )
@@ -1233,11 +1270,11 @@ where
 
     /// Notify about propagated transactions.
     pub fn on_propagated(&self, txs: PropagatedTransactions) {
-        if txs.0.is_empty() {
+        if txs.is_empty() {
             return
         }
         self.with_event_listener(|listener| {
-            txs.0.into_iter().for_each(|(hash, peers)| listener.propagated(&hash, peers));
+            txs.into_iter().for_each(|(hash, peers)| listener.propagated(&hash, peers));
         });
     }
 
@@ -1740,5 +1777,21 @@ mod tests {
 
         let identifiers = test_pool.identifiers.read();
         assert_eq!(identifiers.sender_id(&auth), Some(SenderId::from(1)));
+    }
+
+    #[test]
+    fn sender_queries_do_not_allocate_ids_for_unknown_addresses() {
+        let test_pool = &TestPoolBuilder::default().with_config(Default::default()).pool;
+        let sender = Address::new([9; 20]);
+
+        assert_eq!(test_pool.sender_id(&sender), None);
+        assert!(test_pool.get_transactions_by_sender(sender).is_empty());
+        assert!(test_pool.get_pending_transaction_by_sender_and_nonce(sender, 0).is_none());
+        assert!(test_pool.get_queued_transactions_by_sender(sender).is_empty());
+        assert!(test_pool.get_pending_transactions_by_sender(sender).is_empty());
+        assert!(test_pool.get_highest_transaction_by_sender(sender).is_none());
+        assert!(test_pool.get_highest_consecutive_transaction_by_sender(sender, 0).is_none());
+        assert!(test_pool.remove_transactions_by_sender(sender).is_empty());
+        assert_eq!(test_pool.sender_id(&sender), None);
     }
 }

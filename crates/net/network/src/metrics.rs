@@ -46,6 +46,9 @@ pub struct NetworkMetrics {
     /// Number of Eth Requests dropped due to channel being at full capacity
     pub(crate) total_dropped_eth_requests_at_full_capacity: Counter,
 
+    /// Number of transaction events dropped due to the tx manager channel being at full capacity
+    pub(crate) total_dropped_tx_events_at_full_capacity: Counter,
+
     /* ================ POLL DURATION ================ */
 
     /* -- Total poll duration of `NetworksManager` future -- */
@@ -143,6 +146,8 @@ pub struct SessionManagerMetrics {
     pub(crate) total_outgoing_peer_messages_dropped: Counter,
     /// Number of queued outgoing messages
     pub(crate) queued_outgoing_messages: Gauge,
+    /// Total number of broadcast messages sent via the unbounded overflow channel.
+    pub(crate) total_unbounded_broadcast_msgs: Counter,
 }
 
 /// Metrics for the [`TransactionsManager`](crate::transactions::TransactionsManager).
@@ -291,7 +296,7 @@ pub struct TransactionFetcherMetrics {
 #[macro_export]
 macro_rules! duration_metered_exec {
     ($code:expr, $acc:expr) => {{
-        let start = std::time::Instant::now();
+        let start = reth_primitives_traits::FastInstant::now();
 
         let res = $code;
 
@@ -299,6 +304,34 @@ macro_rules! duration_metered_exec {
 
         res
     }};
+}
+
+/// Direction-aware wrapper for disconnect metrics.
+///
+/// Tracks disconnect reasons for inbound and outbound connections separately, in addition to
+/// the combined (legacy) counters.
+#[derive(Debug, Default)]
+pub(crate) struct DirectionalDisconnectMetrics {
+    /// Combined disconnect metrics (all directions).
+    pub(crate) total: DisconnectMetrics,
+    /// Disconnect metrics for inbound connections only.
+    pub(crate) inbound: InboundDisconnectMetrics,
+    /// Disconnect metrics for outbound connections only.
+    pub(crate) outbound: OutboundDisconnectMetrics,
+}
+
+impl DirectionalDisconnectMetrics {
+    /// Increments disconnect counters for an inbound connection.
+    pub(crate) fn increment_inbound(&self, reason: DisconnectReason) {
+        self.total.increment(reason);
+        self.inbound.increment(reason);
+    }
+
+    /// Increments disconnect counters for an outbound connection.
+    pub(crate) fn increment_outbound(&self, reason: DisconnectReason) {
+        self.total.increment(reason);
+        self.outbound.increment(reason);
+    }
 }
 
 /// Metrics for Disconnection types
@@ -370,6 +403,144 @@ impl DisconnectMetrics {
     }
 }
 
+/// Disconnect metrics scoped to inbound connections only.
+///
+/// These counters track disconnect reasons exclusively for sessions that were initiated by
+/// remote peers connecting to this node. This helps operators distinguish between being rejected
+/// by remote peers (outbound) vs rejecting incoming peers (inbound).
+#[derive(Metrics)]
+#[metrics(scope = "network.inbound")]
+pub struct InboundDisconnectMetrics {
+    /// Number of inbound peer disconnects due to `DisconnectRequested` (0x00)
+    pub(crate) disconnect_requested: Counter,
+
+    /// Number of inbound peer disconnects due to `TcpSubsystemError` (0x01)
+    pub(crate) tcp_subsystem_error: Counter,
+
+    /// Number of inbound peer disconnects due to `ProtocolBreach` (0x02)
+    pub(crate) protocol_breach: Counter,
+
+    /// Number of inbound peer disconnects due to `UselessPeer` (0x03)
+    pub(crate) useless_peer: Counter,
+
+    /// Number of inbound peer disconnects due to `TooManyPeers` (0x04)
+    pub(crate) too_many_peers: Counter,
+
+    /// Number of inbound peer disconnects due to `AlreadyConnected` (0x05)
+    pub(crate) already_connected: Counter,
+
+    /// Number of inbound peer disconnects due to `IncompatibleP2PProtocolVersion` (0x06)
+    pub(crate) incompatible: Counter,
+
+    /// Number of inbound peer disconnects due to `NullNodeIdentity` (0x07)
+    pub(crate) null_node_identity: Counter,
+
+    /// Number of inbound peer disconnects due to `ClientQuitting` (0x08)
+    pub(crate) client_quitting: Counter,
+
+    /// Number of inbound peer disconnects due to `UnexpectedHandshakeIdentity` (0x09)
+    pub(crate) unexpected_identity: Counter,
+
+    /// Number of inbound peer disconnects due to `ConnectedToSelf` (0x0a)
+    pub(crate) connected_to_self: Counter,
+
+    /// Number of inbound peer disconnects due to `PingTimeout` (0x0b)
+    pub(crate) ping_timeout: Counter,
+
+    /// Number of inbound peer disconnects due to `SubprotocolSpecific` (0x10)
+    pub(crate) subprotocol_specific: Counter,
+}
+
+impl InboundDisconnectMetrics {
+    /// Increments the proper counter for the given disconnect reason
+    pub(crate) fn increment(&self, reason: DisconnectReason) {
+        match reason {
+            DisconnectReason::DisconnectRequested => self.disconnect_requested.increment(1),
+            DisconnectReason::TcpSubsystemError => self.tcp_subsystem_error.increment(1),
+            DisconnectReason::ProtocolBreach => self.protocol_breach.increment(1),
+            DisconnectReason::UselessPeer => self.useless_peer.increment(1),
+            DisconnectReason::TooManyPeers => self.too_many_peers.increment(1),
+            DisconnectReason::AlreadyConnected => self.already_connected.increment(1),
+            DisconnectReason::IncompatibleP2PProtocolVersion => self.incompatible.increment(1),
+            DisconnectReason::NullNodeIdentity => self.null_node_identity.increment(1),
+            DisconnectReason::ClientQuitting => self.client_quitting.increment(1),
+            DisconnectReason::UnexpectedHandshakeIdentity => self.unexpected_identity.increment(1),
+            DisconnectReason::ConnectedToSelf => self.connected_to_self.increment(1),
+            DisconnectReason::PingTimeout => self.ping_timeout.increment(1),
+            DisconnectReason::SubprotocolSpecific => self.subprotocol_specific.increment(1),
+        }
+    }
+}
+
+/// Disconnect metrics scoped to outbound connections only.
+///
+/// These counters track disconnect reasons exclusively for sessions that this node initiated
+/// by dialing out to remote peers. A high `too_many_peers` count here indicates remote peers
+/// are rejecting our connection attempts because they are full.
+#[derive(Metrics)]
+#[metrics(scope = "network.outbound")]
+pub struct OutboundDisconnectMetrics {
+    /// Number of outbound peer disconnects due to `DisconnectRequested` (0x00)
+    pub(crate) disconnect_requested: Counter,
+
+    /// Number of outbound peer disconnects due to `TcpSubsystemError` (0x01)
+    pub(crate) tcp_subsystem_error: Counter,
+
+    /// Number of outbound peer disconnects due to `ProtocolBreach` (0x02)
+    pub(crate) protocol_breach: Counter,
+
+    /// Number of outbound peer disconnects due to `UselessPeer` (0x03)
+    pub(crate) useless_peer: Counter,
+
+    /// Number of outbound peer disconnects due to `TooManyPeers` (0x04)
+    pub(crate) too_many_peers: Counter,
+
+    /// Number of outbound peer disconnects due to `AlreadyConnected` (0x05)
+    pub(crate) already_connected: Counter,
+
+    /// Number of outbound peer disconnects due to `IncompatibleP2PProtocolVersion` (0x06)
+    pub(crate) incompatible: Counter,
+
+    /// Number of outbound peer disconnects due to `NullNodeIdentity` (0x07)
+    pub(crate) null_node_identity: Counter,
+
+    /// Number of outbound peer disconnects due to `ClientQuitting` (0x08)
+    pub(crate) client_quitting: Counter,
+
+    /// Number of outbound peer disconnects due to `UnexpectedHandshakeIdentity` (0x09)
+    pub(crate) unexpected_identity: Counter,
+
+    /// Number of outbound peer disconnects due to `ConnectedToSelf` (0x0a)
+    pub(crate) connected_to_self: Counter,
+
+    /// Number of outbound peer disconnects due to `PingTimeout` (0x0b)
+    pub(crate) ping_timeout: Counter,
+
+    /// Number of outbound peer disconnects due to `SubprotocolSpecific` (0x10)
+    pub(crate) subprotocol_specific: Counter,
+}
+
+impl OutboundDisconnectMetrics {
+    /// Increments the proper counter for the given disconnect reason
+    pub(crate) fn increment(&self, reason: DisconnectReason) {
+        match reason {
+            DisconnectReason::DisconnectRequested => self.disconnect_requested.increment(1),
+            DisconnectReason::TcpSubsystemError => self.tcp_subsystem_error.increment(1),
+            DisconnectReason::ProtocolBreach => self.protocol_breach.increment(1),
+            DisconnectReason::UselessPeer => self.useless_peer.increment(1),
+            DisconnectReason::TooManyPeers => self.too_many_peers.increment(1),
+            DisconnectReason::AlreadyConnected => self.already_connected.increment(1),
+            DisconnectReason::IncompatibleP2PProtocolVersion => self.incompatible.increment(1),
+            DisconnectReason::NullNodeIdentity => self.null_node_identity.increment(1),
+            DisconnectReason::ClientQuitting => self.client_quitting.increment(1),
+            DisconnectReason::UnexpectedHandshakeIdentity => self.unexpected_identity.increment(1),
+            DisconnectReason::ConnectedToSelf => self.connected_to_self.increment(1),
+            DisconnectReason::PingTimeout => self.ping_timeout.increment(1),
+            DisconnectReason::SubprotocolSpecific => self.subprotocol_specific.increment(1),
+        }
+    }
+}
+
 /// Metrics for the `EthRequestHandler`
 #[derive(Metrics)]
 #[metrics(scope = "network")]
@@ -385,6 +556,9 @@ pub struct EthRequestHandlerMetrics {
 
     /// Number of `GetNodeData` requests received
     pub(crate) eth_node_data_requests_received_total: Counter,
+
+    /// Number of `GetBlockAccessLists` requests received
+    pub(crate) eth_block_access_lists_requests_received_total: Counter,
 
     /// Duration in seconds of call to poll
     /// [`EthRequestHandler`](crate::eth_requests::EthRequestHandler).
@@ -409,6 +583,9 @@ pub struct AnnouncedTxTypesMetrics {
 
     /// Histogram for tracking frequency of EIP-7702 transaction type
     pub(crate) eip7702: Histogram,
+
+    /// Histogram for tracking frequency of unknown/other transaction types
+    pub(crate) other: Histogram,
 }
 
 /// Counts the number of transactions by their type in a block or collection.
@@ -431,6 +608,9 @@ pub struct TxTypesCounter {
 
     /// Count of transactions conforming to EIP-7702 (Restricted Storage Windows).
     pub(crate) eip7702: usize,
+
+    /// Count of unknown/other transaction types not matching any known EIP.
+    pub(crate) other: usize,
 }
 
 impl TxTypesCounter {
@@ -453,6 +633,10 @@ impl TxTypesCounter {
             }
         }
     }
+
+    pub(crate) const fn increase_other(&mut self) {
+        self.other += 1;
+    }
 }
 
 impl AnnouncedTxTypesMetrics {
@@ -464,5 +648,6 @@ impl AnnouncedTxTypesMetrics {
         self.eip1559.record(tx_types_counter.eip1559 as f64);
         self.eip4844.record(tx_types_counter.eip4844 as f64);
         self.eip7702.record(tx_types_counter.eip7702 as f64);
+        self.other.record(tx_types_counter.other as f64);
     }
 }

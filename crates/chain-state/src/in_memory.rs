@@ -17,10 +17,7 @@ use reth_primitives_traits::{
     SignedTransaction,
 };
 use reth_storage_api::StateProviderBox;
-use reth_trie::{
-    updates::TrieUpdatesSorted, HashedPostStateSorted, LazyTrieData, SortedTrieData,
-    TrieInputSorted,
-};
+use reth_trie::{updates::TrieUpdatesSorted, HashedPostStateSorted, LazyTrieData, SortedTrieData};
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use tokio::sync::{broadcast, watch};
 
@@ -806,13 +803,12 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
     /// This is useful if the trie data is populated somewhere else, e.g. asynchronously
     /// after the block was validated.
     ///
-    /// The [`DeferredTrieData`] handle allows expensive trie operations (sorting hashed state,
-    /// sorting trie updates, and building the accumulated trie input overlay) to be performed
-    /// outside the critical validation path. This can improve latency for time-sensitive
-    /// operations like block validation.
+    /// The [`DeferredTrieData`] handle allows expensive trie operations (sorting hashed state and
+    /// trie updates) to be performed outside the critical validation path by a background task.
+    /// This can improve latency for time-sensitive operations like block validation.
     ///
-    /// If the data hasn't been populated when [`Self::trie_data()`] is called, computation
-    /// occurs synchronously from stored inputs, so there is no blocking or deadlock risk.
+    /// If the data hasn't been populated when [`Self::trie_data()`] is called, the caller waits
+    /// for the background task to publish it.
     ///
     /// Use [`Self::new()`] instead when trie data is already computed and available immediately.
     pub const fn with_deferred_trie_data(
@@ -841,11 +837,11 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         &self.execution_output
     }
 
-    /// Returns the trie data, computing it synchronously if not already cached.
+    /// Returns the trie data, waiting for the background task if not already cached.
     ///
     /// Uses `OnceLock::get_or_init` internally:
     /// - If already computed: returns cached result immediately
-    /// - If not computed: first caller computes, others wait for that result
+    /// - If not computed: first caller waits for the publishing task, others wait for that result
     #[inline]
     #[tracing::instrument(level = "debug", target = "engine::tree", name = "trie_data", skip_all)]
     pub fn trie_data(&self) -> ComputedTrieData {
@@ -855,8 +851,7 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
     /// Returns a clone of the deferred trie data handle.
     ///
     /// A handle is a lightweight reference that can be passed to descendants without
-    /// forcing trie data to be computed immediately. The actual work runs when
-    /// `wait_cloned()` is called by a consumer (e.g. when merging overlays).
+    /// forcing trie data to be observed immediately. The actual work runs in the background task.
     #[inline]
     pub fn trie_data_handle(&self) -> DeferredTrieData {
         self.trie_data.clone()
@@ -864,7 +859,7 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
 
     /// Returns the hashed state result of the execution outcome.
     ///
-    /// May compute trie data synchronously if the deferred task hasn't completed.
+    /// May wait for trie data if the deferred task hasn't completed.
     #[inline]
     pub fn hashed_state(&self) -> Arc<HashedPostStateSorted> {
         self.trie_data().hashed_state
@@ -872,24 +867,10 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
 
     /// Returns the trie updates resulting from the execution outcome.
     ///
-    /// May compute trie data synchronously if the deferred task hasn't completed.
+    /// May wait for trie data if the deferred task hasn't completed.
     #[inline]
     pub fn trie_updates(&self) -> Arc<TrieUpdatesSorted> {
         self.trie_data().trie_updates
-    }
-
-    /// Returns the trie input anchored to the persisted ancestor.
-    ///
-    /// May compute trie data synchronously if the deferred task hasn't completed.
-    #[inline]
-    pub fn trie_input(&self) -> Option<Arc<TrieInputSorted>> {
-        self.trie_data().trie_input().cloned()
-    }
-
-    /// Returns the anchor hash of the trie input, if present.
-    #[inline]
-    pub fn anchor_hash(&self) -> Option<B256> {
-        self.trie_data().anchor_hash()
     }
 
     /// Returns a [`BlockNumber`] of the block.
@@ -953,7 +934,7 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
             [first, rest @ ..] => {
                 let trie_data_handle = first.trie_data_handle();
                 let mut chain = Chain::from_block(
-                    first.recovered_block().clone(),
+                    Arc::clone(&first.recovered_block),
                     ExecutionOutcome::from((
                         first.execution_outcome().clone(),
                         first.block_number(),
@@ -969,7 +950,7 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
                 for exec in rest {
                     let trie_data_handle = exec.trie_data_handle();
                     chain.append_block(
-                        exec.recovered_block().clone(),
+                        Arc::clone(&exec.recovered_block),
                         ExecutionOutcome::from((
                             exec.execution_outcome().clone(),
                             exec.block_number(),
@@ -992,7 +973,7 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
     ///
     /// Returns the new tip for [`Self::Reorg`] and [`Self::Commit`] variants which commit at least
     /// 1 new block.
-    pub fn tip(&self) -> &SealedBlock<N::Block> {
+    pub fn tip(&self) -> &RecoveredBlock<N::Block> {
         match self {
             Self::Commit { new } | Self::Reorg { new, .. } => {
                 new.last().expect("non empty blocks").recovered_block()
@@ -1114,7 +1095,10 @@ mod tests {
     }
 
     impl HashedPostStateProvider for MockStateProvider {
-        fn hashed_post_state(&self, _bundle_state: &revm_database::BundleState) -> HashedPostState {
+        fn hashed_post_state(
+            &self,
+            _bundle_state: &revm::database::BundleState,
+        ) -> HashedPostState {
             HashedPostState::default()
         }
     }
@@ -1169,6 +1153,7 @@ mod tests {
             &self,
             _input: TrieInput,
             _target: HashedPostState,
+            _mode: reth_trie::ExecutionWitnessMode,
         ) -> ProviderResult<Vec<Bytes>> {
             Ok(Vec::default())
         }

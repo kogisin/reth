@@ -3,9 +3,10 @@ use crate::{
     segments::{PruneInput, Segment, SegmentOutput},
     PrunerError,
 };
-use alloy_eips::eip2718::Encodable2718;
+use alloy_consensus::transaction::TxHashRef;
 use rayon::prelude::*;
 use reth_db_api::{tables, transaction::DbTxMut};
+use reth_primitives_traits::SignedTransaction;
 use reth_provider::{
     BlockReader, DBProvider, PruneCheckpointReader, RocksDBProviderFactory,
     StaticFileProviderFactory,
@@ -31,7 +32,7 @@ impl TransactionLookup {
 impl<Provider> Segment<Provider> for TransactionLookup
 where
     Provider: DBProvider<Tx: DbTxMut>
-        + BlockReader<Transaction: Encodable2718>
+        + BlockReader<Transaction: SignedTransaction>
         + PruneCheckpointReader
         + StaticFileProviderFactory
         + StorageSettingsCache
@@ -95,8 +96,7 @@ where
         .into_inner();
 
         // Check where transaction hash numbers are stored
-        #[cfg(all(unix, feature = "rocksdb"))]
-        if provider.cached_storage_settings().transaction_hash_numbers_in_rocksdb {
+        if provider.cached_storage_settings().storage_v2 {
             return self.prune_rocksdb(provider, input, start, end);
         }
 
@@ -132,11 +132,11 @@ where
                 .unwrap();
         let tx_range_end = *tx_range.end();
 
-        // Retrieve transactions in the range and calculate their hashes in parallel
+        // Retrieve transactions in the range and collect their hashes in parallel.
         let mut hashes = provider
             .transactions_by_tx_range(tx_range.clone())?
             .into_par_iter()
-            .map(|transaction| transaction.trie_hash())
+            .map(|transaction| *transaction.tx_hash())
             .collect::<Vec<_>>();
 
         // Sort hashes to enable efficient cursor traversal through the TransactionHashNumbers
@@ -196,7 +196,6 @@ impl TransactionLookup {
     ///
     /// Reads transactions from static files and deletes corresponding entries
     /// from the `RocksDB` `TransactionHashNumbers` table.
-    #[cfg(all(unix, feature = "rocksdb"))]
     fn prune_rocksdb<Provider>(
         &self,
         provider: &Provider,
@@ -206,7 +205,7 @@ impl TransactionLookup {
     ) -> Result<SegmentOutput, PrunerError>
     where
         Provider: DBProvider
-            + BlockReader<Transaction: Encodable2718>
+            + BlockReader<Transaction: SignedTransaction>
             + StaticFileProviderFactory
             + RocksDBProviderFactory,
     {
@@ -237,11 +236,11 @@ impl TransactionLookup {
             .map_or(end, |limited| limited.min(end));
         let tx_range = start..=tx_range_end;
 
-        // Retrieve transactions in the range and calculate their hashes in parallel
+        // Retrieve transactions in the range and collect their hashes in parallel.
         let hashes: Vec<_> = provider
             .transactions_by_tx_range(tx_range.clone())?
             .into_par_iter()
-            .map(|transaction| transaction.trie_hash())
+            .map(|transaction| *transaction.tx_hash())
             .collect();
 
         // Number of transactions retrieved from the database should match the tx range count
@@ -438,7 +437,6 @@ mod tests {
         test_prune(10, (PruneProgress::Finished, 8));
     }
 
-    #[cfg(all(unix, feature = "rocksdb"))]
     #[test]
     fn prune_rocksdb() {
         use reth_db_api::models::StorageSettings;
@@ -491,9 +489,7 @@ mod tests {
         let segment = TransactionLookup::new(prune_mode);
 
         // Enable RocksDB storage for transaction hash numbers
-        db.factory.set_storage_settings_cache(
-            StorageSettings::v1().with_transaction_hash_numbers_in_rocksdb(true),
-        );
+        db.factory.set_storage_settings_cache(StorageSettings::v2());
 
         let provider = db.factory.database_provider_rw().unwrap();
         let result = segment.prune(&provider, input).unwrap();
@@ -541,7 +537,6 @@ mod tests {
     /// 1. Some transactions have already been pruned (checkpoint at tx 5)
     /// 2. The deleted entries limit is exhausted before any new deletions
     /// 3. The checkpoint should NOT advance to the next start position
-    #[cfg(all(unix, feature = "rocksdb"))]
     #[test]
     fn prune_rocksdb_zero_deleted_checkpoint() {
         use reth_db_api::models::StorageSettings;
@@ -578,9 +573,7 @@ mod tests {
         }
 
         // Enable RocksDB storage for transaction hash numbers
-        db.factory.set_storage_settings_cache(
-            StorageSettings::v1().with_transaction_hash_numbers_in_rocksdb(true),
-        );
+        db.factory.set_storage_settings_cache(StorageSettings::v2());
 
         let to_block: BlockNumber = 6;
         let prune_mode = PruneMode::Before(to_block);

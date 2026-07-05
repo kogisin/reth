@@ -1,4 +1,3 @@
-use alloy_eips::eip2718::Encodable2718;
 use alloy_genesis::Genesis;
 use alloy_primitives::{b256, hex, Address};
 use futures::StreamExt;
@@ -7,6 +6,7 @@ use reth_node_api::{BlockBody, FullNodeComponents};
 use reth_node_builder::{rpc::RethRpcAddOns, FullNode, NodeBuilder, NodeConfig, NodeHandle};
 use reth_node_core::args::DevArgs;
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
+use reth_primitives_traits::transaction::TxHashRef;
 use reth_provider::{providers::BlockchainProvider, CanonStateSubscriptions};
 use reth_rpc_eth_api::{helpers::EthTransactions, EthApiServer};
 use reth_tasks::Runtime;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 #[tokio::test]
 async fn can_run_dev_node() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let runtime = Runtime::with_existing_handle(tokio::runtime::Handle::current()).unwrap();
+    let runtime = Runtime::test();
 
     let node_config = NodeConfig::test()
         .with_chain(custom_chain())
@@ -36,7 +36,7 @@ async fn can_run_dev_node() -> eyre::Result<()> {
 #[tokio::test]
 async fn can_run_dev_node_custom_attributes() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let runtime = Runtime::with_existing_handle(tokio::runtime::Handle::current()).unwrap();
+    let runtime = Runtime::test();
 
     let node_config = NodeConfig::test()
         .with_chain(custom_chain())
@@ -99,7 +99,7 @@ where
     let head = notifications.next().await.unwrap();
 
     let tx = &head.tip().body().transactions()[0];
-    assert_eq!(tx.trie_hash(), hash);
+    assert_eq!(*tx.tx_hash(), hash);
     println!("mined transaction: {hash}");
 }
 

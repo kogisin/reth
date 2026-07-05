@@ -9,9 +9,12 @@ use alloy_primitives::{
 };
 use alloy_trie::BranchNodeCompact;
 use reth_execution_errors::SparseTrieResult;
-use reth_trie_common::{BranchNodeMasks, Nibbles, ProofTrieNode, TrieNode};
+use reth_trie_common::{
+    prefix_set::PrefixSetMut, BranchNodeMasks, Nibbles, ProofTrieNodeV2, TrieNodeV2,
+};
 
-use crate::provider::TrieNodeProvider;
+#[cfg(feature = "trie-debug")]
+use crate::debug_recorder::TrieDebugRecorder;
 
 /// Describes an update to a leaf in the sparse trie.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,9 +41,8 @@ impl LeafUpdate {
 
 /// Trait defining common operations for revealed sparse trie implementations.
 ///
-/// This trait abstracts over different sparse trie implementations (serial vs parallel)
-/// while providing a unified interface for the core trie operations needed by the
-/// [`crate::RevealableSparseTrie`] enum.
+/// This trait provides a unified interface for the core trie operations needed by
+/// `RevealableSparseTrie`.
 pub trait SparseTrie: Sized + Debug + Send + Sync {
     /// Configures the trie to have the given root node revealed.
     ///
@@ -59,23 +61,10 @@ pub trait SparseTrie: Sized + Debug + Send + Sync {
     /// May panic if the trie is not new/cleared, and has already revealed nodes.
     fn set_root(
         &mut self,
-        root: TrieNode,
+        root: TrieNodeV2,
         masks: Option<BranchNodeMasks>,
         retain_updates: bool,
     ) -> SparseTrieResult<()>;
-
-    /// Configures the trie to have the given root node revealed.
-    ///
-    /// See [`Self::set_root`] for more details.
-    fn with_root(
-        mut self,
-        root: TrieNode,
-        masks: Option<BranchNodeMasks>,
-        retain_updates: bool,
-    ) -> SparseTrieResult<Self> {
-        self.set_root(root, masks, retain_updates)?;
-        Ok(self)
-    }
 
     /// Configures the trie to retain information about updates.
     ///
@@ -88,34 +77,8 @@ pub trait SparseTrie: Sized + Debug + Send + Sync {
     /// * `retain_updates` - Whether to track updates
     fn set_updates(&mut self, retain_updates: bool);
 
-    /// Configures the trie to retain information about updates.
-    ///
-    /// See [`Self::set_updates`] for more details.
-    fn with_updates(mut self, retain_updates: bool) -> Self {
-        self.set_updates(retain_updates);
-        self
-    }
-
-    /// Reserves capacity for additional trie nodes.
-    ///
-    /// # Arguments
-    ///
-    /// * `additional` - The number of additional trie nodes to reserve capacity for.
-    fn reserve_nodes(&mut self, _additional: usize) {}
-
-    /// The single-node version of `reveal_nodes`.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if successful, or an error if the node was not revealed.
-    fn reveal_node(
-        &mut self,
-        path: Nibbles,
-        node: TrieNode,
-        masks: Option<BranchNodeMasks>,
-    ) -> SparseTrieResult<()> {
-        self.reveal_nodes(&mut [ProofTrieNode { path, node, masks }])
-    }
+    /// Configures the trie to retain changed node base paths during hashing.
+    fn set_changed_paths(&mut self, retain_changed_paths: bool);
 
     /// Reveals one or more trie nodes if they have not been revealed before.
     ///
@@ -135,48 +98,8 @@ pub trait SparseTrie: Sized + Debug + Send + Sync {
     /// # Note
     ///
     /// The implementation may modify the input nodes. A common thing to do is [`std::mem::replace`]
-    /// each node with [`TrieNode::EmptyRoot`] to avoid cloning.
-    fn reveal_nodes(&mut self, nodes: &mut [ProofTrieNode]) -> SparseTrieResult<()>;
-
-    /// Updates the value of a leaf node at the specified path.
-    ///
-    /// If the leaf doesn't exist, it will be created.
-    /// If it does exist, its value will be updated.
-    ///
-    /// # Arguments
-    ///
-    /// * `full_path` - The full path to the leaf
-    /// * `value` - The new value for the leaf
-    /// * `provider` - The trie provider for resolving missing nodes
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if successful, or an error if the update failed.
-    fn update_leaf<P: TrieNodeProvider>(
-        &mut self,
-        full_path: Nibbles,
-        value: Vec<u8>,
-        provider: P,
-    ) -> SparseTrieResult<()>;
-
-    /// Removes a leaf node at the specified path.
-    ///
-    /// This will also handle collapsing the trie structure as needed
-    /// (e.g., removing branch nodes that become unnecessary).
-    ///
-    /// # Arguments
-    ///
-    /// * `full_path` - The full path to the leaf to remove
-    /// * `provider` - The trie node provider for resolving missing nodes
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if successful, or an error if the removal failed.
-    fn remove_leaf<P: TrieNodeProvider>(
-        &mut self,
-        full_path: &Nibbles,
-        provider: P,
-    ) -> SparseTrieResult<()>;
+    /// each node with [`TrieNodeV2::EmptyRoot`] to avoid cloning.
+    fn reveal_nodes(&mut self, nodes: &mut [ProofTrieNodeV2]) -> SparseTrieResult<()>;
 
     /// Calculates and returns the root hash of the trie.
     ///
@@ -256,6 +179,13 @@ pub trait SparseTrie: Sized + Debug + Send + Sync {
     /// The accumulated updates, or an empty set if updates weren't being tracked.
     fn take_updates(&mut self) -> SparseTrieUpdates;
 
+    /// Consumes and returns the currently accumulated changed node base paths.
+    ///
+    /// Ancestor paths may be excluded when a descendant path is already present.
+    ///
+    /// Returns an empty set if changed paths weren't being tracked.
+    fn take_changed_paths(&mut self) -> PrefixSetMut;
+
     /// Removes all nodes and values from the trie, resetting it to a blank state
     /// with only an empty root node. This is used when a storage root is deleted.
     ///
@@ -266,18 +196,10 @@ pub trait SparseTrie: Sized + Debug + Send + Sync {
     fn wipe(&mut self);
 
     /// This clears all data structures in the sparse trie, keeping the backing data structures
-    /// allocated. A [`crate::SparseNode::Empty`] is inserted at the root.
+    /// allocated. An empty root node is inserted at the root.
     ///
     /// This is useful for reusing the trie without needing to reallocate memory.
     fn clear(&mut self);
-
-    /// Shrink the capacity of the sparse trie's node storage to the given size.
-    /// This will reduce memory usage if the current capacity is higher than the given size.
-    fn shrink_nodes_to(&mut self, size: usize);
-
-    /// Shrink the capacity of the sparse trie's value storage to the given size.
-    /// This will reduce memory usage if the current capacity is higher than the given size.
-    fn shrink_values_to(&mut self, size: usize);
 
     /// Returns a cheap O(1) size hint for the trie representing the count of revealed
     /// (non-Hash) nodes.
@@ -286,25 +208,38 @@ pub trait SparseTrie: Sized + Debug + Send + Sync {
     /// during pruning. Larger values indicate larger tries that are more valuable to preserve.
     fn size_hint(&self) -> usize;
 
-    /// Replaces nodes beyond `max_depth` with hash stubs and removes their descendants.
+    /// Returns a heuristic for the in-memory size of this trie in bytes.
     ///
-    /// Depth counts nodes traversed (not nibbles), so extension nodes count as 1 depth
-    /// regardless of key length. `max_depth == 0` prunes all children of the root node.
+    /// This is an approximation that accounts for the trie's nodes, values,
+    /// and auxiliary data structures.
+    fn memory_size(&self) -> usize;
+
+    /// Prunes all subtrees that do not contain retained leaves.
+    ///
+    /// Each retained leaf is a full key path (usually 64 nibbles for hashed keys).
+    /// Any revealed subtree that is not a prefix of at least one retained key is collapsed into
+    /// hash stubs when hashes are available.
     ///
     /// # Preconditions
     ///
-    /// Must be called after `root()` to ensure all nodes have computed hashes.
-    /// Calling on a trie without computed hashes will result in no pruning.
+    /// Must be called only after `root()` has computed hashes for the current trie state.
+    /// Calling `prune` on a dirty trie is a hard error and may panic.
     ///
-    /// # Behavior
-    ///
-    /// - Embedded nodes (RLP < 32 bytes) are preserved since they have no hash
-    /// - Returns 0 if `max_depth` exceeds trie depth or trie is empty
+    /// `retained_leaves` must be sorted lexicographically.
     ///
     /// # Returns
     ///
     /// The number of nodes converted to hash stubs.
-    fn prune(&mut self, max_depth: usize) -> usize;
+    fn prune(&mut self, retained_leaves: &[Nibbles]) -> usize;
+
+    /// Takes the debug recorder out of this trie, replacing it with an empty one.
+    ///
+    /// Returns the recorder containing all recorded mutations since the last reset.
+    /// The default implementation returns an empty recorder.
+    #[cfg(feature = "trie-debug")]
+    fn take_debug_recorder(&mut self) -> TrieDebugRecorder {
+        TrieDebugRecorder::default()
+    }
 
     /// Applies leaf updates to the sparse trie.
     ///
